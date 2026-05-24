@@ -1,0 +1,52 @@
+# Dependabot keeps dependencies patched and surfaces vulnerable transitive
+# deps. Updates are grouped so routine minor/patch bumps land as a single PR
+# per ecosystem instead of flooding the queue; security updates are always
+# raised individually and promptly by Dependabot regardless of these groups.
+version: 2
+updates:
+  # Rust workspace (root Cargo.lock covers all `crates/*` members).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Frontend (pnpm). Dependabot reads client/pnpm-lock.yaml.
+  - package-ecosystem: npm
+    directory: "/client"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      client-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Cloudflare lobby worker (npm).
+  - package-ecosystem: npm
+    directory: "/lobby-worker"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      lobby-worker-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # GitHub Actions used by the CI/deploy/release workflows.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions-all:
+        patterns:
+          - "*"

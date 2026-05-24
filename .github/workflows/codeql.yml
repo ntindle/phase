@@ -1,0 +1,54 @@
+name: CodeQL
+
+# Static analysis (SAST) for the TypeScript client + Cloudflare worker.
+#
+# Requires "Code scanning" to be enabled for the repository (Settings →
+# Security → Code security). On a fork this also needs Actions enabled, and
+# results only upload on a repo with code scanning available (public repos, or
+# private repos with GitHub Advanced Security). Rust is intentionally not
+# analyzed here — `cargo clippy -D warnings` and `cargo audit` cover the Rust
+# side; add a `rust` language entry once the runner's CodeQL supports it.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'client/**'
+      - 'lobby-worker/**'
+      - '.github/workflows/codeql.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'client/**'
+      - 'lobby-worker/**'
+      - '.github/workflows/codeql.yml'
+  schedule:
+    - cron: '0 7 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (javascript-typescript)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript-typescript"

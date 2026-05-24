@@ -1,0 +1,77 @@
+name: Security
+
+# Dependency vulnerability scanning. Runs on dependency/lockfile changes, on
+# every PR to main, and weekly so advisories filed against otherwise-unchanged
+# dependencies are still caught.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'client/pnpm-lock.yaml'
+      - 'client/package.json'
+      - 'lobby-worker/package-lock.json'
+      - 'lobby-worker/package.json'
+      - '.github/workflows/security.yml'
+  pull_request:
+    branches: [main]
+  schedule:
+    # Mondays 07:00 UTC.
+    - cron: '0 7 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    name: cargo audit (RUSTSEC advisories)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-shared-key: rust-debug
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Fails the job on known vulnerabilities in the Rust dependency tree.
+      # Unmaintained-crate notices are warnings and do not fail the build; add
+      # `--deny warnings` here once the tree is clean if you want to gate those
+      # too. Use a committed `audit.toml` to ignore individual advisory IDs.
+      - name: cargo audit
+        run: cargo audit
+
+  js-audit:
+    name: npm/pnpm audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Reported but non-blocking for now: frontend dev-dependency advisories
+      # are noisy and rarely reach production. Review the job summary and flip
+      # `continue-on-error` to false (and tune `--audit-level`) to enforce.
+      - name: pnpm audit (client)
+        continue-on-error: true
+        run: cd client && pnpm audit --audit-level high
+
+      - name: npm audit (lobby-worker)
+        continue-on-error: true
+        run: cd lobby-worker && npm audit --audit-level=high

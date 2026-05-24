@@ -10,8 +10,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{State, WebSocketUpgrade};
-use axum::response::IntoResponse;
+use axum::extract::{Request, State, WebSocketUpgrade};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use clap::Parser;
@@ -23,7 +24,7 @@ use engine::game::derived_views::derive_views;
 use engine::game::validate_name_deck_for_format;
 use engine::types::game_state::GameState;
 use engine::types::player::PlayerId;
-use http::HeaderValue;
+use http::{HeaderValue, StatusCode};
 use lobby_broker::{check_build_commit, Broker, BrokerEnv, BuildCommitCheck, ConnState, Outbound};
 use seat_reducer::types::{DeckChoice, DeckResolver, ReducerCtx};
 use server_core::draft_session::DraftSessionManager;
@@ -145,6 +146,12 @@ struct Cli {
     /// Allowed CORS origin (use '*' for permissive, or a specific URL)
     #[arg(long, env = "PHASE_CORS_ORIGIN")]
     cors_origin: Option<String>,
+
+    /// Bearer token gating all `/admin/*` endpoints. When unset, the admin
+    /// endpoints are disabled entirely (they return 404) so they are never
+    /// reachable unauthenticated. Set to a high-entropy secret in production.
+    #[arg(long, env = "PHASE_ADMIN_TOKEN")]
+    admin_token: Option<String>,
 
     /// Emit logs as JSON (for production log aggregation)
     #[arg(long, env = "PHASE_LOG_JSON")]
@@ -683,19 +690,43 @@ async fn main() {
             .allow_origin(origin.parse::<HeaderValue>().expect("invalid CORS origin")),
     };
 
+    // Operator bearer token for `/admin/*`. Empty/whitespace is treated as
+    // unset so a blank env var can't accidentally authorize every request.
+    let admin_token: Option<Arc<str>> = cli
+        .admin_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(Arc::from);
+    if admin_token.is_none() {
+        info!("PHASE_ADMIN_TOKEN unset — /admin/* endpoints are disabled (404)");
+    }
+
     // Keep references for shutdown flush (Arcs are cheap to clone)
     let shutdown_state = state.clone();
     let shutdown_draft_state = draft_sessions.clone();
     let shutdown_game_db = game_db.clone();
 
-    let app = Router::new()
-        .route("/ws", get(ws_handler))
-        .route("/health", get(health))
+    // Admin routes expose player reconnect tokens and force-delete, so they are
+    // gated behind the bearer-token middleware. `route_layer` runs the guard
+    // only on matched admin paths (unknown paths still 404 without auth work).
+    let admin_routes = Router::new()
         .route("/admin/drafts", get(admin::admin_list_drafts))
         .route(
             "/admin/drafts/{code}",
             get(admin::admin_get_draft).delete(admin::admin_delete_draft),
         )
+        .route_layer(middleware::from_fn_with_state(
+            admin_token,
+            require_admin_auth,
+        ));
+
+    let app = Router::new()
+        .route("/ws", get(ws_handler))
+        .route("/health", get(health))
+        .merge(admin_routes)
+        // P2P backup endpoints are client-facing (the P2P draft host uploads
+        // snapshots), so they are not behind the operator token.
         .route("/p2p-draft-backup", post(admin::p2p_backup_store))
         .route(
             "/p2p-draft-backup/{code}",
@@ -796,6 +827,44 @@ async fn shutdown_signal() {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Constant-time byte comparison, used so the admin token check does not leak
+/// the secret through response timing. Length is allowed to short-circuit
+/// (token length is not sensitive); the bytes themselves are compared in full.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Bearer-token gate for `/admin/*`. Fails closed: when no token is configured
+/// the endpoints behave as if they do not exist (404), so administrative draft
+/// inspection/deletion (which exposes player reconnect tokens) is never
+/// reachable unauthenticated. With a token configured, the request must carry
+/// `Authorization: Bearer <token>`.
+async fn require_admin_auth(
+    State(token): State<Option<Arc<str>>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(expected) = token.as_deref() else {
+        return (StatusCode::NOT_FOUND, "Not found").into_response();
+    };
+    let provided = req
+        .headers()
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match provided {
+        Some(tok) if constant_time_eq(tok.as_bytes(), expected.as_bytes()) => next.run(req).await,
+        _ => (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
+    }
 }
 
 #[derive(Clone)]
