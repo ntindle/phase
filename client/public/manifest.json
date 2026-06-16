@@ -1,21 +1,49 @@
 {
   "name": "phase.rs",
   "short_name": "phase.rs",
-  "description": "Magic: The Gathering Engine",
-  "start_url": "/",
+  "description": "Play phase.rs matches, drafts, decks, and multiplayer from an installed mobile app.",
+  "id": "/",
+  "start_url": "/?source=pwa",
+  "scope": "/",
   "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
   "background_color": "#030712",
   "theme_color": "#030712",
+  "categories": ["games", "entertainment"],
+  "lang": "en-US",
+  "orientation": "any",
   "icons": [
     {
       "src": "/icons/icon-192.png",
       "sizes": "192x192",
-      "type": "image/png"
+      "type": "image/png",
+      "purpose": "any"
     },
     {
       "src": "/icons/icon-512.png",
       "sizes": "512x512",
-      "type": "image/png"
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "New Match",
+      "short_name": "Match",
+      "url": "/setup",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Multiplayer",
+      "short_name": "Online",
+      "url": "/multiplayer",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Decks",
+      "short_name": "Decks",
+      "url": "/my-decks",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
     }
   ]
 }

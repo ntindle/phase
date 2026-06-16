@@ -118,6 +118,16 @@ function dataFileDefines(mode: string): Record<string, string> {
   return defines;
 }
 
+function devServerHmr() {
+  if (process.env.CADDY_PROXY === "1") {
+    return { protocol: "wss" as const, host: "local.phase-rs.dev", clientPort: 443 };
+  }
+  if (process.env.TAURI_DEV_HOST) {
+    return { protocol: "ws" as const, host: process.env.TAURI_DEV_HOST, clientPort: 5173 };
+  }
+  return undefined;
+}
+
 export default defineConfig(({ mode }) => ({
   resolve: {
     alias: {
@@ -207,11 +217,16 @@ export default defineConfig(({ mode }) => ({
   // page origin, so it needs `clientPort: 443` and `protocol: wss` to
   // hit Caddy rather than the bare :5173 dev server. Both are gated on a
   // hostname presence check so plain `pnpm dev` on localhost still works.
+  // Tauri mobile sets `TAURI_DEV_HOST`; binding Vite to that host lets
+  // Android/iOS devices reach the dev server during native app development.
   server: {
-    allowedHosts: ["local.phase-rs.dev", ".local.phase-rs.dev"],
-    hmr: process.env.CADDY_PROXY === "1"
-      ? { protocol: "wss", host: "local.phase-rs.dev", clientPort: 443 }
-      : undefined,
+    host: process.env.TAURI_DEV_HOST || undefined,
+    allowedHosts: [
+      "local.phase-rs.dev",
+      ".local.phase-rs.dev",
+      ...(process.env.TAURI_DEV_HOST ? [process.env.TAURI_DEV_HOST] : []),
+    ],
+    hmr: devServerHmr(),
     // Forward deck-import-service calls to a locally-running `wrangler dev` so
     // the browser sees a same-origin response (no CORS) and the client can use
     // a relative URL identical to its production same-origin proxy path. The

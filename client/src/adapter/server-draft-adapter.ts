@@ -16,6 +16,11 @@ import {
   openPhaseSocket,
   type PhaseSocket,
 } from "../services/openPhaseSocket";
+import {
+  clearServerDraftSession,
+  saveServerDraftSession,
+  type ServerDraftSessionData,
+} from "../services/serverDraftSession";
 import { isValidWebSocketUrl } from "../services/serverDetection";
 import type {
   DraftPlayerView,
@@ -24,6 +29,11 @@ import type {
   PodPolicy,
 } from "./draft-adapter";
 import type { ServerInfo } from "./ws-adapter";
+
+const DRAFT_RECONNECT_BACKOFF_CAP_MS = 5000;
+// Server draft reconnect grace is phase-specific and can be up to 30 minutes
+// in lobby. Keep the client retry window long enough to cover that maximum.
+const MAX_DRAFT_RECONNECT_ATTEMPTS = 360;
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -107,11 +117,25 @@ export class ServerDraftAdapter implements EngineAdapter {
   private initResolve: (() => void) | null = null;
   private initReject: ((error: Error) => void) | null = null;
   private listeners: ServerDraftAdapterEventListener[] = [];
+  private reconnectAttempt = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectInFlight = false;
   private pingInterval: ReturnType<typeof setInterval> | null = null;
+  private lifecycleReconnectHandlersInstalled = false;
   private disposed = false;
   private _serverInfo: ServerInfo | null = null;
 
-  constructor(private readonly serverUrl: string) {}
+  constructor(
+    private readonly serverUrl: string,
+    initialSession?: ServerDraftSessionData,
+  ) {
+    if (initialSession) {
+      this.draftCode = initialSession.draftCode;
+      this.draftToken = initialSession.playerToken;
+      this.seatIndex = initialSession.seatIndex;
+    }
+    this.installLifecycleReconnectHandlers();
+  }
 
   // ── Public accessors ───────────────────────────────────────────────
 
@@ -129,6 +153,14 @@ export class ServerDraftAdapter implements EngineAdapter {
 
   get currentDraftView(): DraftPlayerView | null {
     return this.draftView;
+  }
+
+  get currentDraftCode(): string | null {
+    return this.draftCode;
+  }
+
+  get currentSeatIndex(): number | null {
+    return this.seatIndex;
   }
 
   get currentMatchId(): string | null {
@@ -359,7 +391,7 @@ export class ServerDraftAdapter implements EngineAdapter {
             compatible: false,
           });
         }
-        return;
+        throw err;
       }
       const adapterErr = new AdapterError("WS_ERROR", String(err), true);
       if (this.initReject) {
@@ -372,7 +404,7 @@ export class ServerDraftAdapter implements EngineAdapter {
         this.draftResolve = null;
         this.draftReject = null;
       }
-      return;
+      throw err;
     }
 
     this.ws = socket.ws;
@@ -399,6 +431,9 @@ export class ServerDraftAdapter implements EngineAdapter {
     };
 
     socket.ws.onclose = () => {
+      if (this.ws === socket.ws) {
+        this.ws = null;
+      }
       if (this.pingInterval) {
         clearInterval(this.pingInterval);
         this.pingInterval = null;
@@ -426,6 +461,7 @@ export class ServerDraftAdapter implements EngineAdapter {
         this.initReject = null;
       } else if (this.draftToken && !this.disposed) {
         this.emit({ type: "disconnected" });
+        this.attemptDraftReconnect();
       }
     };
 
@@ -459,6 +495,7 @@ export class ServerDraftAdapter implements EngineAdapter {
         this.draftCode = data.draft_code;
         this.draftToken = data.player_token;
         this.seatIndex = data.seat_index;
+        this.persistDraftSession();
         this.emit({ type: "waitingForPlayers" });
         if (this.initResolve) {
           this.initResolve();
@@ -480,6 +517,7 @@ export class ServerDraftAdapter implements EngineAdapter {
         this.seatIndex = data.seat_index;
         this.draftView = data.view;
         this.updatePhaseFromView(data.view);
+        this.persistDraftSession();
         if (this.draftResolve) {
           this.draftResolve(data.view);
           this.draftResolve = null;
@@ -492,6 +530,17 @@ export class ServerDraftAdapter implements EngineAdapter {
         const data = msg.data as { view: DraftPlayerView };
         this.draftView = data.view;
         this.updatePhaseFromView(data.view);
+        this.persistDraftSession();
+        if (this.reconnectInFlight) {
+          this.reconnectInFlight = false;
+          this.reconnectAttempt = 0;
+          this.emit({ type: "reconnected" });
+          if (this.initResolve) {
+            this.initResolve();
+            this.initResolve = null;
+            this.initReject = null;
+          }
+        }
         this.emit({ type: "draftViewUpdated", view: data.view });
         if (this.draftResolve) {
           this.draftResolve(data.view);
@@ -514,12 +563,20 @@ export class ServerDraftAdapter implements EngineAdapter {
         this.activeMatchId = data.match_id;
         this._playerId = data.your_player;
         this._gameCode = data.game_code;
+        this.persistDraftSession();
         this.emit({
           type: "matchStarting",
           matchId: data.match_id,
           round: data.round,
           opponentName: data.opponent_name,
           gameCode: data.game_code,
+        });
+        this.send({
+          type: "Reconnect",
+          data: {
+            game_code: data.game_code,
+            player_token: data.player_token,
+          },
         });
         break;
       }
@@ -533,6 +590,11 @@ export class ServerDraftAdapter implements EngineAdapter {
       case "DraftActionRejected": {
         const data = msg.data as { reason: string };
         this.emit({ type: "draftActionRejected", reason: data.reason });
+        if (this.reconnectInFlight) {
+          clearServerDraftSession();
+          this.draftCode = null;
+          this.draftToken = null;
+        }
         if (this.draftReject) {
           this.draftReject(
             new AdapterError("ACTION_REJECTED", data.reason, true),
@@ -540,11 +602,20 @@ export class ServerDraftAdapter implements EngineAdapter {
           this.draftResolve = null;
           this.draftReject = null;
         }
+        if (this.initReject) {
+          this.reconnectInFlight = false;
+          this.initReject(
+            new AdapterError("ACTION_REJECTED", data.reason, true),
+          );
+          this.initResolve = null;
+          this.initReject = null;
+        }
         break;
       }
 
       case "DraftOver": {
         this.phase = "complete";
+        clearServerDraftSession();
         const data = msg.data as { standings: StandingEntry[] };
         this.emit({ type: "draftOver", standings: data.standings });
         break;
@@ -697,6 +768,8 @@ export class ServerDraftAdapter implements EngineAdapter {
       throw new AdapterError("WS_ERROR", "No draft session to reconnect to", false);
     }
 
+    this.clearReconnectTimer();
+    this.reconnectInFlight = true;
     return new Promise<void>((resolve, reject) => {
       this.initResolve = resolve;
       this.initReject = reject;
@@ -712,7 +785,106 @@ export class ServerDraftAdapter implements EngineAdapter {
     });
   }
 
+  private attemptDraftReconnect(): void {
+    if (this.disposed || this.reconnectInFlight) return;
+    if (!this.draftCode || !this.draftToken) return;
+    if (this.reconnectAttempt >= MAX_DRAFT_RECONNECT_ATTEMPTS) {
+      this.emit({ type: "error", message: "Draft reconnect window expired." });
+      return;
+    }
+
+    this.reconnectAttempt++;
+    const delay = Math.min(
+      Math.pow(2, this.reconnectAttempt - 1) * 1000,
+      DRAFT_RECONNECT_BACKOFF_CAP_MS,
+    );
+    this.clearReconnectTimer();
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.reconnectDraft().catch(() => {
+        if (!this.disposed) {
+          this.reconnectInFlight = false;
+          this.attemptDraftReconnect();
+        }
+      });
+    }, delay);
+  }
+
+  private readonly handleLifecycleResume = (): void => {
+    this.probeReconnectOnResume();
+  };
+
+  private readonly handleVisibilityChange = (): void => {
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+      return;
+    }
+    this.probeReconnectOnResume();
+  };
+
+  private installLifecycleReconnectHandlers(): void {
+    if (this.lifecycleReconnectHandlersInstalled || typeof window === "undefined") {
+      return;
+    }
+    window.addEventListener("online", this.handleLifecycleResume);
+    window.addEventListener("pageshow", this.handleLifecycleResume);
+    window.addEventListener("focus", this.handleLifecycleResume);
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", this.handleVisibilityChange);
+    }
+    this.lifecycleReconnectHandlersInstalled = true;
+  }
+
+  private removeLifecycleReconnectHandlers(): void {
+    if (!this.lifecycleReconnectHandlersInstalled || typeof window === "undefined") {
+      return;
+    }
+    window.removeEventListener("online", this.handleLifecycleResume);
+    window.removeEventListener("pageshow", this.handleLifecycleResume);
+    window.removeEventListener("focus", this.handleLifecycleResume);
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", this.handleVisibilityChange);
+    }
+    this.lifecycleReconnectHandlersInstalled = false;
+  }
+
+  private probeReconnectOnResume(): void {
+    if (this.disposed || this.reconnectInFlight) return;
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.send({ type: "Ping", data: { timestamp: Date.now() } });
+      return;
+    }
+    if (this.ws?.readyState === 0) {
+      return;
+    }
+    if (!this.draftCode || !this.draftToken) return;
+    this.clearReconnectTimer();
+    void this.reconnectDraft().catch(() => {
+      if (!this.disposed) {
+        this.reconnectInFlight = false;
+        this.attemptDraftReconnect();
+      }
+    });
+  }
+
   // ── Utilities ──────────────────────────────────────────────────────
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
+  private persistDraftSession(): void {
+    if (!this.draftCode || !this.draftToken) return;
+    saveServerDraftSession({
+      draftCode: this.draftCode,
+      playerToken: this.draftToken,
+      serverUrl: this.serverUrl,
+      seatIndex: this.seatIndex,
+      timestamp: Date.now(),
+    });
+  }
 
   private startPing(): void {
     if (this.pingInterval) {
@@ -748,6 +920,9 @@ export class ServerDraftAdapter implements EngineAdapter {
 
   dispose(): void {
     this.disposed = true;
+    clearServerDraftSession();
+    this.removeLifecycleReconnectHandlers();
+    this.clearReconnectTimer();
     if (this.pingInterval) {
       clearInterval(this.pingInterval);
       this.pingInterval = null;
@@ -770,6 +945,7 @@ export class ServerDraftAdapter implements EngineAdapter {
     this.draftReject = null;
     this.initResolve = null;
     this.initReject = null;
+    this.reconnectInFlight = false;
     this._serverInfo = null;
     this.emit({ type: "actionPendingChanged", pending: false });
     this.listeners = [];

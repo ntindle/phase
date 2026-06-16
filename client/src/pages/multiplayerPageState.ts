@@ -1,9 +1,14 @@
 import type { GameFormat } from "../adapter/types";
 import type { DeckCompatibilityResult } from "../services/deckCompatibility";
 
-/** Views available on the multiplayer page. "draft-lobby" shows the
- *  multiplayer draft pod lobby after hosting or joining a draft. */
-export type MultiplayerView = "lobby" | "host-setup" | "deck-select" | "draft-lobby";
+/** Views available on the multiplayer page. "draft-lobby" is the P2P pod
+ *  lobby; "server-draft" is the backend-hosted draft lifecycle. */
+export type MultiplayerView =
+  | "lobby"
+  | "host-setup"
+  | "deck-select"
+  | "draft-lobby"
+  | "server-draft";
 
 export type LiveCheck =
   | { status: "idle" }

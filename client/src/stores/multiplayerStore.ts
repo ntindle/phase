@@ -10,6 +10,10 @@ import {
   saveWsSession,
 } from "../services/multiplayerSession";
 import {
+  clearServerDraftSession,
+  loadServerDraftSession,
+} from "../services/serverDraftSession";
+import {
   lookupJoinTargetOver,
   openBrokerClient,
   resolveGuestOver,
@@ -29,7 +33,7 @@ import {
   type ReconnectHandle,
 } from "../services/openPhaseSocket";
 import { isValidWebSocketUrl } from "../services/serverDetection";
-import { saveActiveGame, useGameStore } from "./gameStore";
+import { legalResultState, saveActiveGame, useGameStore } from "./gameStore";
 import type { P2PHostAdapter } from "../adapter/p2p-adapter";
 import {
   ServerDraftAdapter,
@@ -55,6 +59,9 @@ let activeBroker: BrokerClient | null = null;
 let activeBrokerGameCode: string | null = null;
 let activeP2PHostAdapter: P2PHostAdapter | null = null;
 let activeP2PHostGameId: string | null = null;
+let activeServerDraftUnsubscribe: (() => void) | null = null;
+let activeServerDraftPendingMatchId: string | null = null;
+let activeServerDraftRoutedMatchId: string | null = null;
 
 function asDeckPayload(deck: HostingDeck): { main_deck: string[]; sideboard: string[]; commander: string[] } {
   return {
@@ -75,16 +82,29 @@ let gameStartedFired = false;
 // Reconnection state for the hosting WebSocket
 let hostReconnectAttempt = 0;
 let hostReconnectTimer: ReturnType<typeof setTimeout> | null = null;
-const HOST_MAX_RECONNECT_ATTEMPTS = 3;
+const RECONNECT_BACKOFF_CAP_MS = 5000;
+// Matches the default server-hosted game grace window for mobile app switches
+// and network handoffs: 180 capped 5s attempts is roughly 15 minutes.
+const MOBILE_RECONNECT_ATTEMPTS = 180;
+const HOST_MAX_RECONNECT_ATTEMPTS = MOBILE_RECONNECT_ATTEMPTS;
+
+function subscriptionReconnectBackoffMs(attempt: number): number {
+  return Math.min(500 * Math.pow(3, attempt), RECONNECT_BACKOFF_CAP_MS);
+}
+
+function hostReconnectDelayMs(attempt: number): number {
+  return Math.min(Math.pow(2, attempt - 1) * 1000, RECONNECT_BACKOFF_CAP_MS);
+}
 
 /**
  * Long-lived, reconnecting subscription channel. Opened on first
  * multiplayer-home entry via `ensureSubscriptionSocket`, not at app boot:
  * users who never touch multiplayer don't pay for a WS. Shared between
  * the lobby subscribe path (SubscribeLobby / LobbyUpdate traffic) and the
- * P2P guest resolve path (JoinGameWithPassword → PeerInfo). The
- * `withReconnect` wrapper re-handshakes up to 3 times on unexpected
- * drops; `onStateChange` drives pending-RPC rejection and re-subscribe.
+ * P2P guest resolve path (JoinGameWithPassword → PeerInfo). Initial connect
+ * fails fast for offline UX, but a channel that has already opened retries for
+ * the mobile-length reconnect window; `onStateChange` drives pending-RPC
+ * rejection and re-subscribe.
  */
 let subscriptionReconnect: ReconnectHandle | null = null;
 /** Awaiters of the first open — resolves once the handshake lands, or with
@@ -363,6 +383,18 @@ interface MultiplayerActions {
     serverUrl: string,
     settings: CreateDraftSettings,
   ) => Promise<void>;
+  /**
+   * Reconnect the last persisted server-hosted draft after a mobile app
+   * restart. Returns false when there is no valid saved draft or the server
+   * rejects the token.
+   */
+  resumeServerDraft: () => Promise<boolean>;
+  /** Submit a pick in the active server-hosted draft. */
+  submitServerDraftPick: (cardInstanceId: string) => Promise<void>;
+  /** Submit the built main deck in the active server-hosted draft. */
+  submitServerDraftDeck: (mainDeck: string[]) => Promise<void>;
+  /** Leave the active server-hosted draft and clear its persisted token. */
+  leaveServerDraft: () => void;
 }
 
 function disposeActiveP2PHost(): void {
@@ -371,6 +403,107 @@ function disposeActiveP2PHost(): void {
     activeP2PHostAdapter = null;
     activeP2PHostGameId = null;
   }
+}
+
+function disposeActiveServerDraft(adapter: ServerDraftAdapter | null): void {
+  activeServerDraftUnsubscribe?.();
+  activeServerDraftUnsubscribe = null;
+  activeServerDraftPendingMatchId = null;
+  activeServerDraftRoutedMatchId = null;
+  adapter?.dispose();
+}
+
+function bindServerDraftAdapter(
+  adapter: ServerDraftAdapter,
+  set: (partial: Partial<MultiplayerState>) => void,
+  get: () => MultiplayerState & MultiplayerActions,
+): void {
+  activeServerDraftUnsubscribe?.();
+  activeServerDraftUnsubscribe = adapter.onEvent((event) => {
+    switch (event.type) {
+      case "draftViewUpdated":
+        set({
+          draftView: event.view,
+          draftPhase: adapter.currentPhase,
+        });
+        break;
+      case "draftOver":
+        set({
+          draftPhase: "complete",
+          draftView: adapter.currentDraftView,
+        });
+        clearServerDraftSession();
+        break;
+      case "matchStarting": {
+        if (activeServerDraftPendingMatchId !== event.matchId) {
+          activeServerDraftRoutedMatchId = null;
+        }
+        activeServerDraftPendingMatchId = event.matchId;
+        const localPlayerId = adapter.playerId;
+        const opponentPlayerId = localPlayerId == null ? null : localPlayerId === 0 ? 1 : 0;
+        const names = new Map<number, string>();
+        if (localPlayerId != null) names.set(localPlayerId, "You");
+        if (opponentPlayerId != null) names.set(opponentPlayerId, event.opponentName);
+        set({
+          draftPhase: "match",
+          activePlayerId: localPlayerId,
+          opponentDisplayName: event.opponentName,
+          playerNames: names,
+        });
+        break;
+      }
+      case "gameStateUpdated": {
+        const gameId =
+          activeServerDraftPendingMatchId
+          ?? adapter.currentMatchId
+          ?? adapter.gameCode
+          ?? crypto.randomUUID();
+        const shouldRoute = activeServerDraftRoutedMatchId !== gameId;
+        useGameStore.setState((prev) => ({
+          gameId,
+          gameMode: "draft-match",
+          adapter,
+          gameState: event.state,
+          waitingFor: event.state.waiting_for,
+          ...legalResultState(event.legalResult),
+          events: event.events,
+          eventHistory: [...prev.eventHistory, ...event.events].slice(-1000),
+          stateHistory: [],
+          turnCheckpoints: [],
+          startingContest: null,
+        }));
+        if (shouldRoute) {
+          activeServerDraftRoutedMatchId = gameId;
+          set({
+            pendingGameRoute: `/game/${encodeURIComponent(gameId)}?mode=draft-match&source=server-draft`,
+          });
+        }
+        break;
+      }
+      case "gameOver":
+        useGameStore.setState({
+          waitingFor: { type: "GameOver", data: { winner: event.winner } },
+        });
+        break;
+      case "actionPendingChanged":
+        set({ actionPending: event.pending });
+        break;
+      case "disconnected":
+        set({ draftPhase: null });
+        break;
+      case "reconnected":
+        set({
+          draftView: adapter.currentDraftView,
+          draftPhase: adapter.currentPhase,
+        });
+        break;
+      case "error":
+        get().showToast(event.message);
+        break;
+      default:
+        break;
+    }
+  });
 }
 
 function closeHostWebSocket(): void {
@@ -789,7 +922,7 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
           }
 
           hostReconnectAttempt++;
-          const delay = Math.pow(2, hostReconnectAttempt - 1) * 1000;
+          const delay = hostReconnectDelayMs(hostReconnectAttempt);
           hostReconnectTimer = setTimeout(() => {
             hostReconnectTimer = null;
             if (gameStartedFired) return;
@@ -1146,6 +1279,8 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
               // prompt's "Keep trying" button remounts `LobbyView` and
               // starts a fresh retry cycle — recovery stays available.
               attempts: 1,
+              postOpenAttempts: MOBILE_RECONNECT_ATTEMPTS,
+              backoffMs: subscriptionReconnectBackoffMs,
               onStateChange: (state) => {
                 if (state === "open") {
                   const socket = subscriptionReconnect?.current() ?? null;
@@ -1257,18 +1392,65 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
 
       joinServerDraft: async (serverUrl, draftCode, displayName, password) => {
         // Dispose any previous draft adapter before creating a new one.
-        get().draftAdapter?.dispose();
+        disposeActiveServerDraft(get().draftAdapter);
         const adapter = new ServerDraftAdapter(serverUrl);
+        bindServerDraftAdapter(adapter, set, get);
         const view = await adapter.joinDraft(draftCode, displayName, password);
         set({ draftAdapter: adapter, draftView: view, draftPhase: adapter.currentPhase });
       },
 
       createServerDraft: async (serverUrl, settings) => {
         // Dispose any previous draft adapter before creating a new one.
-        get().draftAdapter?.dispose();
+        disposeActiveServerDraft(get().draftAdapter);
         const adapter = new ServerDraftAdapter(serverUrl);
+        bindServerDraftAdapter(adapter, set, get);
         await adapter.createDraft(settings);
         set({ draftAdapter: adapter, draftView: null, draftPhase: "lobby" });
+      },
+
+      resumeServerDraft: async () => {
+        const session = loadServerDraftSession();
+        if (!session) return false;
+
+        disposeActiveServerDraft(get().draftAdapter);
+        const adapter = new ServerDraftAdapter(session.serverUrl, session);
+        bindServerDraftAdapter(adapter, set, get);
+        set({ draftAdapter: adapter, draftView: null, draftPhase: null });
+
+        try {
+          await adapter.reconnectDraft();
+          set({
+            draftAdapter: adapter,
+            draftView: adapter.currentDraftView,
+            draftPhase: adapter.currentPhase,
+          });
+          return true;
+        } catch {
+          disposeActiveServerDraft(adapter);
+          clearServerDraftSession();
+          set({ draftAdapter: null, draftView: null, draftPhase: null });
+          return false;
+        }
+      },
+
+      submitServerDraftPick: async (cardInstanceId) => {
+        const adapter = get().draftAdapter;
+        if (!adapter) throw new Error("Server draft is not active.");
+        const view = await adapter.submitPick(cardInstanceId);
+        set({ draftView: view, draftPhase: adapter.currentPhase });
+      },
+
+      submitServerDraftDeck: async (mainDeck) => {
+        const adapter = get().draftAdapter;
+        if (!adapter) throw new Error("Server draft is not active.");
+        const view = await adapter.submitDeck(mainDeck);
+        set({ draftView: view, draftPhase: adapter.currentPhase });
+      },
+
+      leaveServerDraft: () => {
+        disposeActiveServerDraft(get().draftAdapter);
+        clearServerDraftSession();
+        set({ draftAdapter: null, draftView: null, draftPhase: null });
       },
 
       subscribeLobby: async (onUpdate) => {

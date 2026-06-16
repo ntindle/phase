@@ -315,10 +315,15 @@ impl DraftSessionManager {
                 None,
             );
             let fake_pid = PlayerId(seat as u8);
-            let default_grace = self.reconnect.grace_period;
+            let grace_period = draft_grace_period(&session.session.status);
             self.reconnect
-                .record_disconnect(draft_code, fake_pid, default_grace);
-            info!(draft = %draft_code, seat, "player disconnected");
+                .record_disconnect(draft_code, fake_pid, grace_period);
+            info!(
+                draft = %draft_code,
+                seat,
+                grace_seconds = grace_period.as_secs(),
+                "player disconnected"
+            );
         }
     }
 
@@ -569,6 +574,85 @@ impl DraftSessionManager {
             .map(|s| s.draft_code.clone())
     }
 
+    /// Find the draft match result context for a spawned game.
+    ///
+    /// `spawn_match_games_for_round` maps the two draft seats in a pairing to
+    /// game players 0 and 1 in pairing order. GameOver reports therefore must
+    /// translate the game-local winner back through that pairing instead of
+    /// treating the game player id as the draft seat.
+    pub fn active_match_result_for_game(
+        &self,
+        draft_code: &str,
+        game_code: &str,
+        winner: Option<PlayerId>,
+    ) -> Option<DraftMatchResultReport> {
+        let session = self.sessions.get(draft_code)?;
+        let (match_id, _) = session
+            .active_matches
+            .iter()
+            .find(|(_, gc)| gc.as_str() == game_code)?;
+        let pairing = session
+            .session
+            .pairings
+            .iter()
+            .find(|pairing| pairing.match_id == *match_id)?;
+        let winner_seat = match winner {
+            Some(game_player) => Some(pairing.players.get(usize::from(game_player.0))?.0),
+            None => None,
+        };
+
+        Some(DraftMatchResultReport {
+            match_id: match_id.clone(),
+            winner_seat,
+        })
+    }
+
+    /// Find the currently active spawned match for a draft seat.
+    ///
+    /// `active_matches` is the server authority for spawned game sessions:
+    /// draft-core pairings remain `Pending` until the server later reports the
+    /// match result, while the draft-level status tells us whether match play
+    /// is still live. The player order in `DraftPairing.players` is the same
+    /// order used by `spawn_match_games_for_round`, so it maps directly to
+    /// game player 0/1.
+    pub fn active_match_for_seat(&self, draft_code: &str, seat: usize) -> Option<ActiveDraftMatch> {
+        let session = self.sessions.get(draft_code)?;
+        if session.session.status != DraftStatus::MatchInProgress {
+            return None;
+        }
+        let draft_player = PlayerId(u8::try_from(seat).ok()?);
+
+        for pairing in &session.session.pairings {
+            let Some(player_index) = pairing
+                .players
+                .iter()
+                .position(|player| *player == draft_player)
+            else {
+                continue;
+            };
+            let Some(game_code) = session.active_matches.get(&pairing.match_id) else {
+                continue;
+            };
+            let opponent_index = if player_index == 0 { 1 } else { 0 };
+            let opponent_seat = pairing.players[opponent_index].0 as usize;
+            let opponent_name = session
+                .display_names
+                .get(opponent_seat)
+                .cloned()
+                .unwrap_or_default();
+
+            return Some(ActiveDraftMatch {
+                match_id: pairing.match_id.clone(),
+                round: pairing.round,
+                game_code: game_code.clone(),
+                game_player: PlayerId(player_index as u8),
+                opponent_name,
+            });
+        }
+
+        None
+    }
+
     /// Remove a draft session entirely, cleaning up the token_to_draft index.
     /// Returns the removed session if it existed.
     pub fn remove_draft(&mut self, draft_code: &str) -> Option<DraftSession> {
@@ -599,6 +683,21 @@ pub struct DraftMatchPlayer {
     pub draft_seat: u8,
     pub game_token: String,
     pub game_player: PlayerId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveDraftMatch {
+    pub match_id: String,
+    pub round: u8,
+    pub game_code: String,
+    pub game_player: PlayerId,
+    pub opponent_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftMatchResultReport {
+    pub match_id: String,
+    pub winner_seat: Option<u8>,
 }
 
 fn deck_payload_from_submission(
@@ -633,7 +732,8 @@ pub fn generate_draft_code() -> String {
 
 /// Returns the appropriate reconnect grace period for the given draft phase.
 ///
-/// Longer than the 10s game reconnect because tournaments span hours.
+/// Phase-specific because tournaments span hours but live picks still need a
+/// bounded auto-pick fallback.
 /// - Lobby: 30 min (gathering players)
 /// - Drafting: 5 min (picks in progress, auto-pick kicks in after)
 /// - Deckbuilding: 15 min (building takes time)
@@ -845,6 +945,45 @@ mod tests {
     }
 
     #[test]
+    fn active_match_result_maps_game_player_to_draft_seat() {
+        let mut mgr = DraftSessionManager::new();
+        let (code, _token, _) = mgr.create_draft(test_config(), "Alice".to_string());
+
+        let session = mgr.sessions.get_mut(&code).unwrap();
+        session.session.pairings.push(DraftPairing {
+            round: 2,
+            table: 3,
+            players: [PlayerId(6), PlayerId(3)],
+            match_id: "r2-t3".to_string(),
+            status: PairingStatus::Pending,
+            winner: None,
+        });
+        session
+            .active_matches
+            .insert("r2-t3".to_string(), "GAME01".to_string());
+
+        let player_zero_wins = mgr
+            .active_match_result_for_game(&code, "GAME01", Some(PlayerId(0)))
+            .expect("game player 0 maps through pairing order");
+        assert_eq!(player_zero_wins.match_id, "r2-t3");
+        assert_eq!(player_zero_wins.winner_seat, Some(6));
+
+        let player_one_wins = mgr
+            .active_match_result_for_game(&code, "GAME01", Some(PlayerId(1)))
+            .expect("game player 1 maps through pairing order");
+        assert_eq!(player_one_wins.winner_seat, Some(3));
+
+        let draw = mgr
+            .active_match_result_for_game(&code, "GAME01", None)
+            .expect("draws still report the match");
+        assert_eq!(draw.winner_seat, None);
+
+        assert!(mgr
+            .active_match_result_for_game(&code, "GAME01", Some(PlayerId(2)))
+            .is_none());
+    }
+
+    #[test]
     fn spawn_match_games_skips_pairing_without_submitted_decks() {
         let mut draft_mgr = DraftSessionManager::new();
         let (code, _host_token, _) = draft_mgr.create_draft(test_config(), "Alice".to_string());
@@ -1001,6 +1140,24 @@ mod tests {
             draft_grace_period(&DraftStatus::Complete),
             Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn draft_disconnect_uses_phase_specific_grace_period() {
+        let mut mgr = DraftSessionManager::new();
+        let (code, token, _) = mgr.create_draft(test_config(), "Alice".to_string());
+
+        // If handle_disconnect used the manager default, this disconnect would
+        // expire immediately. Lobby-phase draft grace should keep it reconnectable.
+        mgr.reconnect = ReconnectManager::new(Duration::from_millis(0));
+        mgr.handle_disconnect(&code, 0);
+        std::thread::sleep(Duration::from_millis(1));
+
+        let view = mgr
+            .handle_reconnect(&code, &token)
+            .expect("lobby draft reconnect should still be within phase grace");
+        assert_eq!(view.status, DraftStatus::Lobby);
+        assert!(mgr.sessions[&code].connected[0]);
     }
 
     #[test]

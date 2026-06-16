@@ -1,0 +1,8 @@
+{
+  "bundle": {
+    "externalBin": [],
+    "iOS": {
+      "minimumSystemVersion": "14.0"
+    }
+  }
+}

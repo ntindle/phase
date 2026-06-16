@@ -74,6 +74,8 @@
       "continue": "Continúa donde lo dejaste",
       "resumeDraft": "Reanudar draft",
       "draftPod": "Pod de draft",
+      "serverDraft": "Draft del servidor",
+      "draftCode": "Código {{code}}",
       "activeDeck": "Mazo activo",
       "noActiveDeck": "Elige un mazo para empezar",
       "fromFeeds": "De tus feeds",

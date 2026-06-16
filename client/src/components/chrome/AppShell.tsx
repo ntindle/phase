@@ -59,7 +59,7 @@ export function AppShell() {
             </div>
             {/* Inner Suspense so a lazy route's load swaps ONLY the content area —
                 the rail/scene persist (true SPA feel). */}
-            <main className="shell-content min-w-0 flex-1 max-[820px]:pb-[76px]">
+            <main className="shell-content min-w-0 flex-1 max-[820px]:pb-[calc(76px+env(safe-area-inset-bottom))]">
               <Suspense
                 fallback={
                   <div className="flex min-h-full items-center justify-center py-24">

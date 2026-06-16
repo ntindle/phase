@@ -4,18 +4,6 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    {
-      "identifier": "shell:allow-execute",
-      "allow": [
-        {
-          "name": "binaries/phase-server",
-          "sidecar": true,
-          "args": []
-        }
-      ]
-    },
-    "shell:allow-kill",
-    "shell:allow-stdin-write",
     "shell:allow-open",
     "process:allow-exit",
     "process:allow-restart",

@@ -74,6 +74,8 @@
       "continue": "Reprenez où vous en étiez",
       "resumeDraft": "Reprendre le draft",
       "draftPod": "Pod de draft",
+      "serverDraft": "Draft serveur",
+      "draftCode": "Code {{code}}",
       "activeDeck": "Deck actif",
       "noActiveDeck": "Choisissez un deck pour commencer",
       "fromFeeds": "Depuis vos flux",

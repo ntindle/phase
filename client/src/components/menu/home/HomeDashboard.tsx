@@ -58,13 +58,14 @@ function CardActionButton({ action, disabled }: { action: ActionDef; disabled: b
 function ResumeHero() {
   const { t } = useTranslation("menu");
   const navigate = useNavigate();
-  const { match, matchSummary, quickDraft, pod, resumeMatch } = useResumables();
+  const { match, matchSummary, quickDraft, pod, serverDraft, resumeMatch } = useResumables();
 
   // Build the ordered candidate list: the saved match leads (most-relevant
   // resumable), then drafts by recency. Nothing to resume → render nothing.
   const draftEntries = [
     quickDraft && { updatedAt: quickDraft.updatedAt, cta: t("home.dashboard.resumeDraft"), title: quickDraft.setName ?? quickDraft.setCode.toUpperCase(), chip: t("home.draft.title"), meta: [] as string[], onResume: () => navigate("/draft") },
     pod && { updatedAt: pod.updatedAt, cta: t("home.dashboard.resumeDraft"), title: t("home.dashboard.draftPod"), chip: t("home.dashboard.draftPod"), meta: [] as string[], onResume: () => navigate("/draft") },
+    serverDraft && { updatedAt: serverDraft.timestamp, cta: t("home.dashboard.resumeDraft"), title: t("home.dashboard.serverDraft"), chip: t("home.dashboard.serverDraft"), meta: [t("home.dashboard.draftCode", { code: serverDraft.draftCode })], onResume: () => navigate("/multiplayer?view=server-draft") },
   ].filter(Boolean) as { updatedAt: number; cta: string; title: string; chip: string; meta: string[]; onResume: () => void }[];
   draftEntries.sort((a, b) => b.updatedAt - a.updatedAt);
 

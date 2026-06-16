@@ -126,6 +126,46 @@ If `tilt` is installed, `setup.sh` skips the eager WASM + card-data build and `t
 cd client && pnpm install && pnpm dev # Start frontend
 ```
 
+### Mobile App Development
+
+The native iOS and Android shells use Tauri v2 and the same React/WASM client as
+desktop and web. Run the platform init once per checkout to generate native
+project files under `client/src-tauri/gen/`:
+
+```bash
+cd client
+pnpm tauri:android:init
+pnpm tauri:ios:init   # macOS + Xcode only
+```
+
+After init, use the mobile scripts:
+
+```bash
+pnpm tauri:android:dev     # run on Android device/emulator
+pnpm tauri:android:open    # open Android Studio
+pnpm tauri:android:build   # APK + AAB
+
+pnpm tauri:ios:dev         # run on iOS device/simulator
+pnpm tauri:ios:open        # open Xcode
+pnpm tauri:ios:build       # IPA
+```
+
+Android builds require Android Studio, `JAVA_HOME`, `ANDROID_HOME`, `NDK_HOME`,
+and Rust Android targets. iOS builds require macOS, Xcode, CocoaPods, and Rust
+iOS targets. The Vite dev server honors Tauri's `TAURI_DEV_HOST` so physical
+devices can reach hot reload during mobile development. The multiplayer client
+keeps live game, server-draft, pregame host, and lobby/broker sockets retrying
+after they have connected, so foregrounding the app after an OS pause or network
+handoff can resume the same session. Server-hosted drafts use phase-specific
+reconnect grace windows, from short post-completion recovery to a 30-minute
+lobby grace window. Draft lobby metadata and active competitive pick timers are
+persisted so waiting drafts relist and timed picks re-arm after a server restart.
+
+Tauri's `tauri.android.conf.json` and `tauri.ios.conf.json` overlays keep
+desktop-only sidecar binaries out of mobile bundles; the runtime also skips
+localhost sidecar auto-detection on mobile shells, so mobile multiplayer uses a
+remote `phase-server` over WebSocket.
+
 ## Dedicated Server
 
 The easiest way to run a dedicated multiplayer server is the Docker image:
@@ -163,6 +203,7 @@ Docker uses environment variables for the common options:
 | `PHASE_LOBBY_ONLY` | `--lobby-only` | false | Matchmaking broker mode |
 | `PHASE_LOG_JSON` | `--log-json` | false | Emit JSON logs |
 | `PHASE_LOG_DIR` | `--log-dir` | stdout | Write logs to files |
+| `PHASE_RECONNECT_GRACE_SECONDS` | `--reconnect-grace-seconds` | `900` | Server-hosted game reconnect window |
 
 You can also pass server flags after the image name:
 

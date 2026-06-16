@@ -1,0 +1,20 @@
+{
+  "identifier": "desktop-sidecar",
+  "description": "Allow the desktop app to launch the bundled phase-server sidecar.",
+  "windows": ["main"],
+  "platforms": ["linux", "macOS", "windows"],
+  "permissions": [
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "binaries/phase-server",
+          "sidecar": true,
+          "args": []
+        }
+      ]
+    },
+    "shell:allow-kill",
+    "shell:allow-stdin-write"
+  ]
+}

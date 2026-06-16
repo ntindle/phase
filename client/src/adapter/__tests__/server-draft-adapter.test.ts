@@ -1,7 +1,11 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ServerDraftAdapter } from "../server-draft-adapter";
 import type { DraftPlayerView } from "../draft-adapter";
+import {
+  clearServerDraftSession,
+  loadServerDraftSession,
+} from "../../services/serverDraftSession";
 
 // ── MockWebSocket (copied from ws-adapter.test.ts) ─────────────────────
 
@@ -82,10 +86,19 @@ function createMockDraftView(overrides: Partial<DraftPlayerView> = {}): DraftPla
 describe("ServerDraftAdapter", () => {
   let adapter: ServerDraftAdapter;
   let ws: MockWebSocket;
+  let adapters: ServerDraftAdapter[];
+
+  function trackAdapter<T extends ServerDraftAdapter>(value: T): T {
+    adapters.push(value);
+    return value;
+  }
 
   beforeEach(async () => {
+    vi.useFakeTimers();
+    adapters = [];
+    clearServerDraftSession();
     MockWebSocket.last = null;
-    adapter = new ServerDraftAdapter("ws://localhost:9374/ws");
+    adapter = trackAdapter(new ServerDraftAdapter("ws://localhost:9374/ws"));
     // Start a createDraft flow — this triggers attachSocket.
     const createPromise = adapter.createDraft({
       displayName: "Alice",
@@ -106,6 +119,14 @@ describe("ServerDraftAdapter", () => {
       }),
     );
     await createPromise;
+  });
+
+  afterEach(() => {
+    for (const createdAdapter of adapters) {
+      createdAdapter.dispose();
+    }
+    clearServerDraftSession();
+    vi.useRealTimers();
   });
 
   it("transitions phase to match on DraftMatchStart", () => {
@@ -129,6 +150,15 @@ describe("ServerDraftAdapter", () => {
     expect(adapter.currentPhase).toBe("match");
     expect(adapter.playerId).toBe(0);
     expect(adapter.currentMatchId).toBe("r1-t0");
+    expect(ws.send).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "Reconnect",
+        data: {
+          game_code: "GAME01",
+          player_token: "gametok",
+        },
+      }),
+    );
   });
 
   it("routes submitAction only during match phase", async () => {
@@ -140,7 +170,9 @@ describe("ServerDraftAdapter", () => {
 
   it("rejects createDraft when the post-handshake setup frame cannot be sent", async () => {
     MockWebSocket.last = null;
-    const setupFailingAdapter = new ServerDraftAdapter("ws://localhost:9374/ws");
+    const setupFailingAdapter = trackAdapter(
+      new ServerDraftAdapter("ws://localhost:9374/ws"),
+    );
     const createPromise = setupFailingAdapter.createDraft({
       displayName: "Alice",
       setCode: "MKM",
@@ -289,6 +321,66 @@ describe("ServerDraftAdapter", () => {
     expect(result.pick_number).toBe(1);
   });
 
+  it("persists draft reconnect credentials after creating a server draft", () => {
+    expect(loadServerDraftSession()).toMatchObject({
+      draftCode: "ABCD12",
+      playerToken: "tok123",
+      serverUrl: "ws://localhost:9374/ws",
+      seatIndex: 0,
+    });
+  });
+
+  it("reconnects a fresh adapter from a persisted server draft session", async () => {
+    const saved = loadServerDraftSession();
+    expect(saved).not.toBeNull();
+
+    const restored = trackAdapter(
+      new ServerDraftAdapter("ws://localhost:9374/ws", saved!),
+    );
+    const reconnectPromise = restored.reconnectDraft();
+    const reconnectWs = await completeHandshake();
+
+    expect(reconnectWs.send).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "ReconnectDraft",
+        data: {
+          draft_code: "ABCD12",
+          player_token: "tok123",
+        },
+      }),
+    );
+
+    reconnectWs.dispatchSynthetic(
+      "message",
+      JSON.stringify({
+        type: "DraftStateUpdate",
+        data: { view: createMockDraftView({ pick_number: 5 }) },
+      }),
+    );
+    await reconnectPromise;
+
+    expect(restored.currentDraftView?.pick_number).toBe(5);
+    expect(loadServerDraftSession()).toMatchObject({
+      draftCode: "ABCD12",
+      playerToken: "tok123",
+      seatIndex: 0,
+    });
+  });
+
+  it("clears persisted draft credentials when the draft completes", () => {
+    expect(loadServerDraftSession()).not.toBeNull();
+
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({
+        type: "DraftOver",
+        data: { standings: [] },
+      }),
+    );
+
+    expect(loadServerDraftSession()).toBeNull();
+  });
+
   it("DraftStateUpdate resolves pending pick promise", async () => {
     const pickPromise = adapter.submitPick("card-002");
 
@@ -302,6 +394,56 @@ describe("ServerDraftAdapter", () => {
 
     const result = await pickPromise;
     expect(result.pick_number).toBe(2);
+  });
+
+  it("reconnects draft immediately on mobile resume when the socket is already closed", async () => {
+    const listener = vi.fn();
+    adapter.onEvent(listener);
+
+    ws.readyState = 3; // CLOSED without an onclose callback.
+    window.dispatchEvent(new Event("online"));
+    const reconnectWs = await completeHandshake();
+
+    expect(reconnectWs.send).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "ReconnectDraft",
+        data: {
+          draft_code: "ABCD12",
+          player_token: "tok123",
+        },
+      }),
+    );
+
+    reconnectWs.dispatchSynthetic(
+      "message",
+      JSON.stringify({
+        type: "DraftStateUpdate",
+        data: { view: createMockDraftView({ pick_number: 3 }) },
+      }),
+    );
+
+    expect(listener).toHaveBeenCalledWith({ type: "reconnected" });
+    expect(adapter.currentDraftView?.pick_number).toBe(3);
+  });
+
+  it("clears a scheduled draft reconnect before an immediate resume reconnect", async () => {
+    ws.readyState = 3; // CLOSED
+    ws.dispatchSynthetic("close");
+
+    window.dispatchEvent(new Event("online"));
+    const reconnectWs = await completeHandshake();
+    reconnectWs.dispatchSynthetic(
+      "message",
+      JSON.stringify({
+        type: "DraftStateUpdate",
+        data: { view: createMockDraftView({ pick_number: 4 }) },
+      }),
+    );
+
+    expect(adapter.currentDraftView?.pick_number).toBe(4);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(MockWebSocket.last).toBe(reconnectWs);
   });
 
   it("DraftTimerSync emits timerSync event", () => {

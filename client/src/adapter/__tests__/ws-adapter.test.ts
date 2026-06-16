@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { WebSocketAdapter } from "../ws-adapter";
 import type { GameState } from "../types";
@@ -101,14 +101,21 @@ function createMockState(): GameState {
 describe("WebSocketAdapter", () => {
   let adapter: WebSocketAdapter;
   let ws: MockWebSocket;
+  let adapters: WebSocketAdapter[];
+
+  function trackAdapter<T extends WebSocketAdapter>(value: T): T {
+    adapters.push(value);
+    return value;
+  }
 
   beforeEach(async () => {
+    adapters = [];
     MockWebSocket.last = null;
-    adapter = new WebSocketAdapter(
+    adapter = trackAdapter(new WebSocketAdapter(
       "ws://localhost:9374/ws",
       "host",
       { main_deck: [], sideboard: [] },
-    );
+    ));
     const initPromise = adapter.initialize();
     ws = await completeHandshake(adapter);
     // Simulate GameStarted to resolve init.
@@ -120,6 +127,12 @@ describe("WebSocketAdapter", () => {
       }),
     );
     await initPromise;
+  });
+
+  afterEach(() => {
+    for (const createdAdapter of adapters) {
+      createdAdapter.dispose();
+    }
   });
 
   describe("Bug C: stateChanged emission", () => {
@@ -159,12 +172,12 @@ describe("WebSocketAdapter", () => {
   describe("GameStarted identity event", () => {
     it("emits playerIdentity when GameStarted arrives", async () => {
       MockWebSocket.last = null;
-      const adapter2 = new WebSocketAdapter(
+      const adapter2 = trackAdapter(new WebSocketAdapter(
         "ws://localhost:9374/ws",
         "join",
         { main_deck: [], sideboard: [] },
         "ABC123",
-      );
+      ));
       const listener = vi.fn();
       adapter2.onEvent(listener);
       const initPromise2 = adapter2.initialize();
@@ -188,12 +201,12 @@ describe("WebSocketAdapter", () => {
   describe("reconnect flow", () => {
     it("reconnects with the persisted session after socket close", async () => {
       MockWebSocket.last = null;
-      const reconnectingAdapter = new WebSocketAdapter(
+      const reconnectingAdapter = trackAdapter(new WebSocketAdapter(
         "ws://localhost:9374/ws",
         "join",
         { main_deck: [], sideboard: [] },
         "ABC123",
-      );
+      ));
       const initPromise = reconnectingAdapter.initialize();
       const initialWs = await completeHandshake(reconnectingAdapter);
       initialWs.dispatchSynthetic(
@@ -208,12 +221,16 @@ describe("WebSocketAdapter", () => {
         }),
       );
       await initPromise;
+      const listener = vi.fn();
+      reconnectingAdapter.onEvent(listener);
 
       vi.useFakeTimers();
       try {
         initialWs.dispatchSynthetic("close");
-        await vi.advanceTimersByTimeAsync(1000);
-        vi.useRealTimers();
+        expect(listener).toHaveBeenCalledWith(
+          expect.objectContaining({ type: "reconnecting", attempt: 1 }),
+        );
+        await vi.runOnlyPendingTimersAsync();
 
         const reconnectWs = await completeHandshake(reconnectingAdapter);
 
@@ -233,16 +250,116 @@ describe("WebSocketAdapter", () => {
         vi.useRealTimers();
       }
     });
+
+    it("refreshes the persisted session when reconnect GameStarted omits the player token", async () => {
+      MockWebSocket.last = null;
+      const reconnectingAdapter = trackAdapter(new WebSocketAdapter(
+        "ws://localhost:9374/ws",
+        "join",
+        { main_deck: [], sideboard: [] },
+        "ABC123",
+      ));
+      const listener = vi.fn();
+      reconnectingAdapter.onEvent(listener);
+
+      const initPromise = reconnectingAdapter.initialize();
+      const initialWs = await completeHandshake(reconnectingAdapter);
+      initialWs.dispatchSynthetic(
+        "message",
+        JSON.stringify({
+          type: "GameStarted",
+          data: {
+            state: createMockState(),
+            your_player: 1,
+            player_token: "player-token",
+          },
+        }),
+      );
+      await initPromise;
+      listener.mockClear();
+
+      expect(
+        reconnectingAdapter.tryReconnect({
+          gameCode: "ABC123",
+          playerToken: "player-token",
+          serverUrl: "ws://localhost:9374/ws",
+          timestamp: 1,
+        }),
+      ).toBe(true);
+      const reconnectWs = await completeHandshake(reconnectingAdapter);
+      reconnectWs.dispatchSynthetic(
+        "message",
+        JSON.stringify({
+          type: "GameStarted",
+          data: {
+            state: createMockState(),
+            your_player: 1,
+          },
+        }),
+      );
+
+      expect(listener).toHaveBeenCalledWith({
+        type: "sessionChanged",
+        session: expect.objectContaining({
+          gameCode: "ABC123",
+          playerToken: "player-token",
+          serverUrl: "ws://localhost:9374/ws",
+          timestamp: expect.any(Number),
+        }),
+      });
+      const sessionChanged = listener.mock.calls.find(
+        ([event]) => event.type === "sessionChanged",
+      )?.[0];
+      expect(sessionChanged?.session?.timestamp).toBeGreaterThan(1);
+    });
+
+    it("reconnects immediately on mobile resume when the socket is already closed", async () => {
+      MockWebSocket.last = null;
+      const reconnectingAdapter = trackAdapter(new WebSocketAdapter(
+        "ws://localhost:9374/ws",
+        "join",
+        { main_deck: [], sideboard: [] },
+        "ABC123",
+      ));
+      const initPromise = reconnectingAdapter.initialize();
+      const initialWs = await completeHandshake(reconnectingAdapter);
+      initialWs.dispatchSynthetic(
+        "message",
+        JSON.stringify({
+          type: "GameStarted",
+          data: {
+            state: createMockState(),
+            your_player: 1,
+            player_token: "player-token",
+          },
+        }),
+      );
+      await initPromise;
+
+      initialWs.readyState = 3; // CLOSED without an onclose callback.
+      window.dispatchEvent(new Event("online"));
+      const reconnectWs = await completeHandshake(reconnectingAdapter);
+
+      expect(reconnectWs.send).toHaveBeenCalledWith(
+        JSON.stringify({
+          type: "Reconnect",
+          data: {
+            game_code: "ABC123",
+            player_token: "player-token",
+          },
+        }),
+      );
+    });
   });
 
   describe("send() error handling", () => {
     it("rejects initialize when the post-handshake setup frame cannot be sent", async () => {
       MockWebSocket.last = null;
-      const setupFailingAdapter = new WebSocketAdapter(
+      const setupFailingAdapter = trackAdapter(new WebSocketAdapter(
         "ws://localhost:9374/ws",
         "host",
         { main_deck: [], sideboard: [] },
-      );
+      ));
       const initPromise = setupFailingAdapter.initialize();
       await Promise.resolve();
       const setupWs = MockWebSocket.last!;

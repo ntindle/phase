@@ -12,6 +12,10 @@ import {
   type ActiveDraftPodMeta,
 } from "../services/draftPersistence";
 import {
+  loadServerDraftSession,
+  type ServerDraftSessionData,
+} from "../services/serverDraftSession";
+import {
   clearActiveGame,
   loadActiveGame,
   loadGame,
@@ -39,6 +43,7 @@ export interface Resumables {
   matchSummary: MatchSummary | null;
   quickDraft: ActiveQuickDraftMeta | null;
   pod: ActiveDraftPodMeta | null;
+  serverDraft: ServerDraftSessionData | null;
   /** Resume the saved match (mirrors the menu's resume routing). */
   resumeMatch: () => void;
 }
@@ -55,11 +60,13 @@ export function useResumables(): Resumables {
   const [matchSummary, setMatchSummary] = useState<MatchSummary | null>(null);
   const [quickDraft, setQuickDraft] = useState<ActiveQuickDraftMeta | null>(null);
   const [pod, setPod] = useState<ActiveDraftPodMeta | null>(null);
+  const [serverDraft, setServerDraft] = useState<ServerDraftSessionData | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     setQuickDraft(loadActiveQuickDraft());
     setPod(loadActiveDraftPod());
+    setServerDraft(loadServerDraftSession());
 
     const saved = loadActiveGame();
     if (!saved) return;
@@ -122,5 +129,5 @@ export function useResumables(): Resumables {
     }
   };
 
-  return { match, matchSummary, quickDraft, pod, resumeMatch };
+  return { match, matchSummary, quickDraft, pod, serverDraft, resumeMatch };
 }

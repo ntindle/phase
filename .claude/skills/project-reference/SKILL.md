@@ -158,7 +158,24 @@ pnpm test                           # Vitest (watch mode)
 pnpm test -- --run                  # Vitest (single run, used in CI)
 pnpm tauri:dev                      # Tauri desktop dev
 pnpm tauri:build                    # Tauri desktop build
+pnpm tauri:android:init             # Generate Android project files
+pnpm tauri:android:dev              # Android device/emulator dev
+pnpm tauri:android:open             # Open Android Studio
+pnpm tauri:android:run              # Run Android production build
+pnpm tauri:android:build            # Build APK + AAB
+pnpm tauri:ios:init                 # Generate iOS project files (macOS only)
+pnpm tauri:ios:dev                  # iOS device/simulator dev
+pnpm tauri:ios:open                 # Open Xcode
+pnpm tauri:ios:run                  # Run iOS production build
+pnpm tauri:ios:build                # Build IPA
 ```
+
+Mobile builds automatically merge `client/src-tauri/tauri.android.conf.json` or
+`client/src-tauri/tauri.ios.conf.json`, which remove desktop-only sidecar
+binary bundling for native mobile shells. The sidecar shell permissions live in
+`client/src-tauri/capabilities/desktop-sidecar.json` and are platform-scoped to
+desktop targets. The client also gates localhost sidecar auto-detection to
+desktop Tauri runtimes.
 
 ### Coverage Report
 ```bash
@@ -212,7 +229,7 @@ Axum WebSocket server with lobby management. Protocol uses discriminated unions:
 - **`ClientMessage`** — `CreateGameWithSettings`, `JoinGameWithPassword`, `Action`, `Reconnect`, `Concede`, `Emote`, `SubscribeLobby`
 - **`ServerMessage`** — `GameCreated`, `GameStarted`, `StateUpdate`, `OpponentDisconnected`, `GameOver`, `LobbyUpdate`, `PlayerCount`
 
-State is filtered per-player (`filter_state_for_player`) to hide opponent's hand/library. Disconnected players get a 10-second reconnect grace period.
+State is filtered per-player (`filter_state_for_player`) to hide opponent's hand/library. Server-hosted games use a configurable reconnect grace period (`PHASE_RECONNECT_GRACE_SECONDS`, default 900 seconds) so mobile clients can resume after app switches and network handoffs. Server-hosted drafts use phase-specific reconnect grace windows, up to 30 minutes in lobby and shorter windows while picks or matches are active. Draft lobby metadata and active competitive pick timers persist across server restarts. Client reconnect windows for live game sockets, server-draft sockets, pregame host sockets, and the lobby/broker subscription channel are aligned to those backend windows after the socket has connected.
 
 ### React Frontend (`client/src/`)
 
@@ -221,7 +238,7 @@ State is filtered per-player (`filter_state_for_player`) to hide opponent's hand
 - **`adapter/`** — Transport-agnostic `EngineAdapter` interface with five implementations:
   - `WasmAdapter` — Direct WASM calls (browser/PWA), serialized through async queue
   - `TauriAdapter` — Tauri IPC (desktop), dynamically imported to avoid bundling in web
-  - `WebSocketAdapter` — WebSocket to phase-server (multiplayer), with reconnection (3 attempts)
+  - `WebSocketAdapter` — WebSocket to phase-server (multiplayer), with a mobile-length reconnect window aligned to server disconnect grace
   - `P2PHostAdapter` / `P2PGuestAdapter` — WebRTC peer-to-peer via PeerJS
   - `createAdapter()` auto-detects platform (Tauri vs browser)
 - **`stores/`** — Zustand stores (`gameStore`, `uiStore`, `animationStore`, `multiplayerStore`, `preferencesStore`).
@@ -245,6 +262,7 @@ State is filtered per-player (`filter_state_for_player`) to hide opponent's hand
 - `PHASE_LOG_DIR` — Log directory for phase-server. When set, logs to files instead of stdout (main log: `<dir>/phase-server.log`, per-game logs: `<dir>/games/<code>.log`)
 - `PHASE_CORS_ORIGIN` — Custom CORS origin for phase-server (default: allows common dev ports)
 - `PHASE_LOG_JSON` — Enable JSON-formatted log output for phase-server
+- `PHASE_RECONNECT_GRACE_SECONDS` — Server-hosted game reconnect grace window in seconds (default `900`)
 
 ## Releasing
 

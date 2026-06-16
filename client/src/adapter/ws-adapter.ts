@@ -19,6 +19,11 @@ import {
 import { isValidWebSocketUrl, mixedContentBlockReason } from "../services/serverDetection";
 import type { WsSessionData } from "../services/multiplayerSession";
 
+const RECONNECT_BACKOFF_CAP_MS = 5000;
+// 180 capped 5s attempts keeps mobile suspend/network-handoff retries alive
+// for roughly the server's default 15-minute disconnect grace window.
+const MAX_RECONNECT_ATTEMPTS = 180;
+
 /** Deck data format matching server protocol. */
 export interface DeckData {
   main_deck: string[];
@@ -119,9 +124,10 @@ export class WebSocketAdapter implements EngineAdapter {
   private initStartEvents: GameEvent[] = [];
   private listeners: WsAdapterEventListener[] = [];
   private reconnectAttempt = 0;
-  private readonly maxReconnectAttempts = 8;
+  private readonly maxReconnectAttempts = MAX_RECONNECT_ATTEMPTS;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingInterval: ReturnType<typeof setInterval> | null = null;
+  private lifecycleReconnectHandlersInstalled = false;
   private disposed = false;
   private gameEnded = false;
   /**
@@ -152,7 +158,9 @@ export class WebSocketAdapter implements EngineAdapter {
     private readonly joinPassword?: string,
     private readonly reservationToken?: string,
     private readonly displayName = "Player",
-  ) {}
+  ) {
+    this.installLifecycleReconnectHandlers();
+  }
 
   get gameCode(): string | null {
     return this._gameCode;
@@ -268,7 +276,7 @@ export class WebSocketAdapter implements EngineAdapter {
             compatible: false,
           });
         }
-        return;
+        throw err;
       }
       if (this.initReject) {
         this.initReject(
@@ -277,7 +285,7 @@ export class WebSocketAdapter implements EngineAdapter {
         this.initResolve = null;
         this.initReject = null;
       }
-      return;
+      throw err;
     }
 
     this.ws = socket.ws;
@@ -299,6 +307,9 @@ export class WebSocketAdapter implements EngineAdapter {
     };
 
     socket.ws.onclose = () => {
+      if (this.ws === socket.ws) {
+        this.ws = null;
+      }
       if (this.pingInterval) {
         clearInterval(this.pingInterval);
         this.pingInterval = null;
@@ -417,6 +428,7 @@ export class WebSocketAdapter implements EngineAdapter {
 
   dispose(): void {
     this.disposed = true;
+    this.removeLifecycleReconnectHandlers();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -447,6 +459,63 @@ export class WebSocketAdapter implements EngineAdapter {
     this.listeners = [];
   }
 
+  private readonly handleLifecycleResume = (): void => {
+    this.probeReconnectOnResume();
+  };
+
+  private readonly handleVisibilityChange = (): void => {
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+      return;
+    }
+    this.probeReconnectOnResume();
+  };
+
+  private installLifecycleReconnectHandlers(): void {
+    if (this.lifecycleReconnectHandlersInstalled || typeof window === "undefined") {
+      return;
+    }
+    window.addEventListener("online", this.handleLifecycleResume);
+    window.addEventListener("pageshow", this.handleLifecycleResume);
+    window.addEventListener("focus", this.handleLifecycleResume);
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", this.handleVisibilityChange);
+    }
+    this.lifecycleReconnectHandlersInstalled = true;
+  }
+
+  private removeLifecycleReconnectHandlers(): void {
+    if (!this.lifecycleReconnectHandlersInstalled || typeof window === "undefined") {
+      return;
+    }
+    window.removeEventListener("online", this.handleLifecycleResume);
+    window.removeEventListener("pageshow", this.handleLifecycleResume);
+    window.removeEventListener("focus", this.handleLifecycleResume);
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", this.handleVisibilityChange);
+    }
+    this.lifecycleReconnectHandlersInstalled = false;
+  }
+
+  private probeReconnectOnResume(): void {
+    if (this.disposed || this.gameEnded || this.reconnectInFlight) return;
+
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.send({ type: "Ping", data: { timestamp: Date.now() } });
+      return;
+    }
+    if (this.ws?.readyState === 0) {
+      return;
+    }
+
+    const session = this.currentSession();
+    if (!session) return;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.tryReconnect(session);
+  }
+
   /** Attempt reconnection using stored session data. */
   tryReconnect(session: WsSessionData): boolean {
     this._gameCode = session.gameCode;
@@ -464,15 +533,24 @@ export class WebSocketAdapter implements EngineAdapter {
         game_code: session.gameCode,
         player_token: session.playerToken,
       },
-    }).catch(() => {
-      // attachSocket handles reconnect-driven retries via `attemptReconnect`
-      // in the close handler; a rejection here is benign.
+    }).catch((err: unknown) => {
+      if (this.disposed || !this.reconnectInFlight || this.gameEnded) return;
+      if (
+        err instanceof HandshakeError &&
+        (err.kind === "protocol_mismatch" || err.kind === "invalid_url")
+      ) {
+        this.reconnectInFlight = false;
+        this.reconnectAttempt = 0;
+        this.emit({ type: "reconnectFailed" });
+        return;
+      }
+      this.attemptReconnect();
     });
     return true;
   }
 
   private attemptReconnect(): void {
-    if (this.disposed) return;
+    if (this.disposed || this.gameEnded) return;
     const session = this.currentSession();
     if (!session) {
       this.emit({ type: "reconnectFailed" });
@@ -483,13 +561,20 @@ export class WebSocketAdapter implements EngineAdapter {
       return;
     }
     this.reconnectAttempt++;
-    const delay = Math.min(Math.pow(2, this.reconnectAttempt - 1) * 1000, 5000);
+    const delay = Math.min(
+      Math.pow(2, this.reconnectAttempt - 1) * 1000,
+      RECONNECT_BACKOFF_CAP_MS,
+    );
     this.emit({
       type: "reconnecting",
       attempt: this.reconnectAttempt,
       maxAttempts: this.maxReconnectAttempts,
     });
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+    }
     this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
       this.tryReconnect(session);
     }, delay);
   }
@@ -616,7 +701,14 @@ export class WebSocketAdapter implements EngineAdapter {
         }
         if (data.player_token) {
           this.playerToken = data.player_token;
-          this.emit({ type: "sessionChanged", session: this.currentSession() });
+        }
+        // Reconnect GameStarted frames intentionally omit player_token, but the
+        // adapter already has it from the saved session. Refresh the persisted
+        // timestamp whenever we have a complete authenticated session so mobile
+        // resumes do not age out while reconnects are succeeding.
+        const session = this.currentSession();
+        if (session) {
+          this.emit({ type: "sessionChanged", session });
         }
         const playerNames = data.player_names === undefined
           ? undefined

@@ -8,7 +8,13 @@ function currentLocalPlayerId(): PlayerId {
   if (gameMode === "spectate") {
     return SPECTATOR_PLAYER_ID;
   }
-  if (gameMode && (gameMode === "online" || gameMode === "p2p-host" || gameMode === "p2p-join")) {
+  if (
+    gameMode
+    && (gameMode === "online"
+      || gameMode === "p2p-host"
+      || gameMode === "p2p-join"
+      || gameMode === "draft-match")
+  ) {
     return useMultiplayerStore.getState().activePlayerId ?? PLAYER_ID;
   }
 
@@ -20,7 +26,13 @@ export function usePlayerId(): PlayerId {
   const gameMode = useGameStore((s) => s.gameMode);
   const activePlayerId = useMultiplayerStore((s) => s.activePlayerId);
 
-  if (gameMode && (gameMode === "online" || gameMode === "p2p-host" || gameMode === "p2p-join")) {
+  if (
+    gameMode
+    && (gameMode === "online"
+      || gameMode === "p2p-host"
+      || gameMode === "p2p-join"
+      || gameMode === "draft-match")
+  ) {
     return activePlayerId ?? PLAYER_ID;
   }
 

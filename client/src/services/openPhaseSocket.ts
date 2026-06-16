@@ -243,8 +243,14 @@ export type ReconnectState =
 
 export interface ReconnectOptions {
   signal?: AbortSignal;
-  /** Number of reconnect attempts after an unexpected drop. Default 3. */
+  /** Number of connection attempts before the socket has opened. Default 3. */
   attempts?: number;
+  /**
+   * Number of reconnect attempts after at least one successful open. Defaults
+   * to `attempts`; callers can keep initial offline detection fast while
+   * allowing a live channel to survive mobile suspend/network handoff.
+   */
+  postOpenAttempts?: number;
   /**
    * Milliseconds to wait before attempt `n` (0-indexed). Default yields
    * 500, 1500, 4500 for the first three attempts.
@@ -285,6 +291,7 @@ export function withReconnect(
   const {
     signal,
     attempts = 3,
+    postOpenAttempts = attempts,
     backoffMs = DEFAULT_BACKOFF,
     onStateChange,
   } = opts;
@@ -293,6 +300,7 @@ export function withReconnect(
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let closed = false;
   let attempt = 0;
+  let hasOpened = false;
 
   const notify = (state: ReconnectState) => {
     try {
@@ -322,6 +330,7 @@ export function withReconnect(
       }
       socket = next;
       attempt = 0;
+      hasOpened = true;
       notify("open");
       next.ws.addEventListener("close", onDrop, { once: true });
     } catch {
@@ -337,7 +346,8 @@ export function withReconnect(
 
   const scheduleRetry = () => {
     if (closed) return;
-    if (attempt >= attempts) {
+    const maxAttempts = hasOpened ? postOpenAttempts : attempts;
+    if (attempt >= maxAttempts) {
       notify("offline");
       return;
     }

@@ -37,7 +37,7 @@ use server_core::client_message_wire_guard::{
     guard_broker_projection_inbound, guard_client_message_before_dispatch,
 };
 use server_core::draft_action_payload_guard::guard_draft_action_payload;
-use server_core::draft_session::DraftSessionManager;
+use server_core::draft_session::{DraftSession, DraftSessionManager};
 use server_core::draft_wire_guard::{
     guard_create_draft_with_settings, guard_draft_action, guard_join_draft_with_password,
     guard_reconnect_draft,
@@ -84,6 +84,8 @@ type SharedPlayerCount = Arc<AtomicU32>;
 type SharedGameDb = Arc<persistence::GameDb>;
 type SharedDraftState = Arc<Mutex<DraftSessionManager>>;
 const SPECTATOR_PLAYER_ID: PlayerId = PlayerId(u8::MAX);
+const DEFAULT_GAME_RECONNECT_GRACE_SECONDS: u64 = 15 * 60;
+const DEFAULT_DRAFT_PICK_TIMER_SECONDS: u32 = 75;
 type SharedDraftPools = Arc<draft_pools::DraftPools>;
 /// Spectator senders keyed by draft_code. Each spectator has a visibility + sender.
 type SharedDraftSpectators = Arc<
@@ -114,6 +116,10 @@ async fn reserve_lobby_subscriber_slot(
     guard_lobby_subscriber_capacity(subs.len())?;
     subs.push(tx.clone());
     Ok(())
+}
+
+fn duration_seconds_for_wire(duration: Duration) -> u32 {
+    duration.as_secs().min(u32::MAX as u64) as u32
 }
 
 async fn remove_game_spectator_sender(
@@ -497,6 +503,17 @@ struct Cli {
     /// `NGROK_AUTHTOKEN` is set, the live tunnel URL is used when this is unset.
     #[arg(long, env = "PUBLIC_URL")]
     public_url: Option<String>,
+
+    /// Reconnect grace window, in seconds, for server-hosted games after a
+    /// player disconnects. Mobile clients routinely lose foreground sockets
+    /// during OS app switches and network handoffs, so the default is long
+    /// enough for a user to reopen the app without forfeiting the match.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_GAME_RECONNECT_GRACE_SECONDS,
+        env = "PHASE_RECONNECT_GRACE_SECONDS"
+    )]
+    reconnect_grace_seconds: u64,
 }
 
 /// Per-socket state tracking which game/player this connection belongs to.
@@ -784,7 +801,14 @@ async fn main() {
         }
     }
 
-    let state: SharedState = Arc::new(Mutex::new(SessionManager::new()));
+    let reconnect_grace = Duration::from_secs(cli.reconnect_grace_seconds);
+    info!(
+        reconnect_grace_seconds = reconnect_grace.as_secs(),
+        "server-hosted game reconnect grace configured"
+    );
+    let state: SharedState = Arc::new(Mutex::new(SessionManager::with_grace_period(
+        reconnect_grace,
+    )));
     let draft_sessions: SharedDraftState = Arc::new(Mutex::new(DraftSessionManager::new()));
     let draft_pools_path = data_path.join("draft-pools.json");
     let draft_pools: SharedDraftPools = match draft_pools::DraftPools::from_path(&draft_pools_path)
@@ -830,7 +854,7 @@ async fn main() {
                                 server_core::session::GameSession::from_persisted(ps, db.as_ref());
 
                             // Register all non-AI human players as disconnected
-                            // to start the 120s grace period from now
+                            // to start the configured grace period from now.
                             let default_grace = mgr.reconnect.grace_period;
                             for (i, token) in session.player_tokens.iter().enumerate() {
                                 let pid = PlayerId(i as u8);
@@ -891,15 +915,57 @@ async fn main() {
         match game_db.load_all_drafts() {
             Ok(persisted_drafts) => {
                 let mut dsm = draft_sessions.lock().await;
+                let mut lob_guard = lobby.lock().await;
+                let lob = lob_guard.lobby_mut();
                 let mut restored_drafts = 0u32;
+                let mut restored_pick_timers: Vec<(String, u32)> = Vec::new();
                 for (draft_code, json) in &persisted_drafts {
                     match serde_json::from_str::<server_core::persist::PersistedDraftSession>(json)
                     {
                         Ok(ps) => {
-                            let timer_ms = ps.timer_remaining_ms;
+                            let lobby_meta = ps.lobby_meta.clone();
                             dsm.restore_session(ps);
-                            if let Some(ms) = timer_ms {
-                                info!(draft = %draft_code, remaining_ms = ms, "draft session has pending timer");
+                            if let Some(session) = dsm.sessions.get(draft_code) {
+                                if session.session.status == draft_core::types::DraftStatus::Lobby {
+                                    if let Some(meta) = lobby_meta {
+                                        lob.register_game(
+                                            draft_code,
+                                            RegisterGameRequest {
+                                                host_name: meta.host_name,
+                                                public: meta.public,
+                                                password: meta.password,
+                                                timer_seconds: meta.timer_seconds,
+                                                current_players: session
+                                                    .player_tokens
+                                                    .iter()
+                                                    .filter(|token| !token.is_empty())
+                                                    .count()
+                                                    as u32,
+                                                max_players: session.player_tokens.len() as u32,
+                                                draft_metadata: Some(
+                                                    server_core::protocol::DraftLobbyMetadata {
+                                                        set_code: session.config.set_code.clone(),
+                                                        draft_kind: format!(
+                                                            "{:?}",
+                                                            session.config.kind
+                                                        ),
+                                                        cube_name: None,
+                                                    },
+                                                ),
+                                                ..Default::default()
+                                            },
+                                            &SysEnv,
+                                        );
+                                    }
+                                }
+                                if let Some(seconds) = restored_pick_timer_seconds(session) {
+                                    restored_pick_timers.push((draft_code.clone(), seconds));
+                                    info!(
+                                        draft = %draft_code,
+                                        pick_timer_seconds = seconds,
+                                        "restored draft pick timer"
+                                    );
+                                }
                             }
                             restored_drafts += 1;
                         }
@@ -911,6 +977,16 @@ async fn main() {
                 }
                 if restored_drafts > 0 {
                     info!(count = restored_drafts, "restored draft sessions from disk");
+                }
+                drop(lob_guard);
+                drop(dsm);
+                for (draft_code, pick_seconds) in restored_pick_timers {
+                    spawn_pick_timer(
+                        draft_sessions.clone(),
+                        connections.clone(),
+                        draft_code,
+                        pick_seconds,
+                    );
                 }
             }
             Err(e) => error!(error = %e, "failed to load persisted draft sessions"),
@@ -1476,14 +1552,17 @@ async fn handle_socket(
     }
 
     if let (Some(game_code), Some(player_id)) = (&identity.game_code, &identity.player_id) {
-        let mut mgr = state.lock().await;
-        mgr.handle_disconnect(game_code, *player_id);
+        let grace_seconds = {
+            let mut mgr = state.lock().await;
+            mgr.handle_disconnect(game_code, *player_id);
+            duration_seconds_for_wire(mgr.reconnect.grace_period)
+        };
 
         // Notify all other connected players about this disconnection
         let conns = connections.lock().await;
         if let Some(players) = conns.get(game_code) {
             let msg = ServerMessage::OpponentDisconnected {
-                grace_seconds: 120,
+                grace_seconds,
                 player: Some(*player_id),
             };
             for (&pid, sender) in players.iter() {
@@ -2085,42 +2164,29 @@ async fn report_draft_game_over(
         return;
     };
 
-    // Find the match_id and winner_seat from the draft session
-    let (match_id, winner_seat) = {
+    // Find the match_id and draft-seat winner from the spawned game.
+    let report = {
         let mgr = draft_state.lock().await;
-        let Some(session) = mgr.sessions.get(&draft_code) else {
+        let Some(report) = mgr.active_match_result_for_game(&draft_code, game_code, winner) else {
+            warn!(draft = %draft_code, game = %game_code, "game_code not found in active draft matches");
             return;
         };
-        // Find the match_id that maps to this game_code
-        let match_entry = session
-            .active_matches
-            .iter()
-            .find(|(_, gc)| gc.as_str() == game_code);
-        let Some((match_id, _)) = match_entry else {
-            warn!(draft = %draft_code, game = %game_code, "game_code not found in active_matches");
-            return;
-        };
-        let match_id = match_id.clone();
-
-        // Map PlayerId winner to seat index
-        let winner_seat = winner.map(|pid| pid.0);
-
-        (match_id, winner_seat)
+        report
     };
 
     info!(
         draft = %draft_code,
         game = %game_code,
-        match_id = %match_id,
-        winner_seat = ?winner_seat,
+        match_id = %report.match_id,
+        winner_seat = ?report.winner_seat,
         "auto-reporting draft match result from GameOver"
     );
 
     let views = {
         let mut mgr = draft_state.lock().await;
         let action = draft_core::types::DraftAction::ReportMatchResult {
-            match_id,
-            winner_seat,
+            match_id: report.match_id,
+            winner_seat: report.winner_seat,
         };
         match mgr.apply_system_action(&draft_code, action, None) {
             Ok(views) => views,
@@ -2260,8 +2326,10 @@ fn spawn_pick_timer(
 
         // Only auto-pick if still in Drafting status
         if session.session.status != draft_core::types::DraftStatus::Drafting {
+            session.timer_remaining_ms = None;
             return;
         }
+        session.timer_remaining_ms = None;
 
         info!(draft = %timer_draft_code, "pick timer expired — auto-picking for pending seats");
 
@@ -2334,12 +2402,38 @@ fn spawn_pick_timer(
             if let Some(prev) = session.timer_task.take() {
                 prev.abort();
             }
+            session.timer_remaining_ms = Some(pick_seconds.saturating_mul(1000));
             session.timer_task = Some(handle);
         }
     });
 }
 
 type DraftPickWindow = (draft_core::types::DraftStatus, u8, u8);
+
+fn draft_pick_timer_seconds(session: &DraftSession) -> u32 {
+    session
+        .lobby_meta
+        .as_ref()
+        .and_then(|meta| meta.timer_seconds)
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DEFAULT_DRAFT_PICK_TIMER_SECONDS)
+}
+
+fn restored_pick_timer_seconds(session: &DraftSession) -> Option<u32> {
+    if session.config.pod_policy != draft_core::types::PodPolicy::Competitive
+        || session.session.status != draft_core::types::DraftStatus::Drafting
+    {
+        return None;
+    }
+
+    Some(
+        session
+            .timer_remaining_ms
+            .filter(|ms| *ms > 0)
+            .map(|ms| ms.div_ceil(1000).max(1))
+            .unwrap_or_else(|| draft_pick_timer_seconds(session)),
+    )
+}
 
 fn should_rearm_pick_timer(
     before: Option<DraftPickWindow>,
@@ -4821,8 +4915,21 @@ async fn handle_client_message(
 
             let (draft_code, player_token, seat_index) = {
                 let mut mgr = draft_state.lock().await;
-                mgr.create_draft(config, display_name.clone())
+                let (draft_code, player_token, seat_index) =
+                    mgr.create_draft(config, display_name.clone());
+                if let Some(session) = mgr.sessions.get_mut(&draft_code) {
+                    session.lobby_meta = Some(server_core::PersistedLobbyMeta {
+                        host_name: display_name.clone(),
+                        public,
+                        password: password.clone(),
+                        timer_seconds,
+                        start_when_full: true,
+                        ranked: false,
+                    });
+                }
+                (draft_code, player_token, seat_index)
             };
+            persist_draft_session_async(game_db, &draft_code, draft_state).await;
 
             identity.draft_code = Some(draft_code.clone());
             identity.draft_seat = Some(seat_index as usize);
@@ -5058,11 +5165,19 @@ async fn handle_client_message(
                 });
                 let should_rearm_timer =
                     result.is_ok() && should_rearm_pick_timer(before_window, after_window);
-                result.map(|views| (views, should_rearm_timer))
+                let pick_seconds = if should_rearm_timer {
+                    mgr.sessions
+                        .get(&draft_code)
+                        .map(draft_pick_timer_seconds)
+                        .unwrap_or(DEFAULT_DRAFT_PICK_TIMER_SECONDS)
+                } else {
+                    DEFAULT_DRAFT_PICK_TIMER_SECONDS
+                };
+                result.map(|views| (views, should_rearm_timer, pick_seconds))
             };
 
             match result {
-                Ok((views, should_rearm_timer)) => {
+                Ok((views, should_rearm_timer, pick_seconds)) => {
                     // Broadcast DraftStateUpdate to all connected sockets in the pod
                     broadcast_draft_views(&draft_code, &views, connections, draft_state).await;
 
@@ -5076,7 +5191,7 @@ async fn handle_client_message(
                             draft_state.clone(),
                             connections.clone(),
                             draft_code.clone(),
-                            75, // default pick timer seconds
+                            pick_seconds,
                         );
                     }
 
@@ -5115,27 +5230,65 @@ async fn handle_client_message(
 
             let result = {
                 let mut mgr = draft_state.lock().await;
-                mgr.handle_reconnect(&draft_code, &player_token)
+                match mgr.handle_reconnect(&draft_code, &player_token) {
+                    Ok(view) => {
+                        let seat = mgr
+                            .sessions
+                            .get(&draft_code)
+                            .and_then(|s| s.seat_for_token(&player_token));
+                        let active_match =
+                            seat.and_then(|seat| mgr.active_match_for_seat(&draft_code, seat));
+                        Ok((view, seat, active_match))
+                    }
+                    Err(reason) => Err(reason),
+                }
             };
 
             match result {
-                Ok(view) => {
+                Ok((view, seat, active_match)) => {
                     // Restore identity
-                    let seat = {
-                        let mgr = draft_state.lock().await;
-                        mgr.sessions
-                            .get(&draft_code)
-                            .and_then(|s| s.seat_for_token(&player_token))
-                    };
                     if let Some(seat) = seat {
                         identity.draft_code = Some(draft_code.clone());
                         identity.draft_seat = Some(seat);
-                        identity.draft_token = Some(player_token);
+                        identity.draft_token = Some(player_token.clone());
+                        let mut conns = connections.lock().await;
+                        conns
+                            .entry(draft_code.clone())
+                            .or_default()
+                            .insert(PlayerId(seat as u8), tx.clone());
                     }
 
                     let msg = ServerMessage::DraftStateUpdate { view };
                     if let Ok(json) = serde_json::to_string(&msg) {
                         let _ = socket.send(Message::text(json)).await;
+                    }
+
+                    if let Some(active_match) = active_match {
+                        let game_token = {
+                            let mgr = state.lock().await;
+                            mgr.sessions
+                                .get(&active_match.game_code)
+                                .and_then(|session| {
+                                    session
+                                        .player_tokens
+                                        .get(active_match.game_player.0 as usize)
+                                })
+                                .filter(|token| !token.is_empty())
+                                .cloned()
+                        };
+                        if let Some(game_token) = game_token {
+                            let msg = ServerMessage::DraftMatchStart {
+                                match_id: active_match.match_id,
+                                round: active_match.round,
+                                game_code: active_match.game_code,
+                                player_token: game_token,
+                                your_player: active_match.game_player,
+                                opponent_name: active_match.opponent_name,
+                            };
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                let _ = socket.send(Message::text(json)).await;
+                            }
+                        }
                     }
 
                     info!(draft = %draft_code, "draft reconnect succeeded");
@@ -5863,6 +6016,47 @@ mod handshake_tests {
         }
     }
 
+    fn draft_timer_config(
+        pod_policy: draft_core::types::PodPolicy,
+    ) -> draft_core::types::DraftConfig {
+        draft_core::types::DraftConfig {
+            source: draft_core::types::DraftSource::Set { code: "TST".into() },
+            set_code: "TST".into(),
+            kind: draft_core::types::DraftKind::Premier,
+            pod_size: 8,
+            cards_per_pack: 14,
+            pack_count: 3,
+            min_deck_size: 40,
+            addable_cards: draft_core::types::DeckAddableCards::standard_basics(),
+            rng_seed: 42,
+            tournament_format: draft_core::types::TournamentFormat::Swiss,
+            pod_policy,
+            spectator_visibility: draft_core::types::SpectatorVisibility::default(),
+        }
+    }
+
+    fn draft_timer_session(
+        pod_policy: draft_core::types::PodPolicy,
+        status: draft_core::types::DraftStatus,
+        timer_seconds: Option<u32>,
+        timer_remaining_ms: Option<u32>,
+    ) -> DraftSession {
+        let mut mgr = DraftSessionManager::new();
+        let (code, _, _) = mgr.create_draft(draft_timer_config(pod_policy), "Alice".to_string());
+        let mut session = mgr.sessions.remove(&code).unwrap();
+        session.session.status = status;
+        session.lobby_meta = Some(server_core::PersistedLobbyMeta {
+            host_name: "Alice".to_string(),
+            public: true,
+            password: None,
+            timer_seconds,
+            start_when_full: true,
+            ranked: false,
+        });
+        session.timer_remaining_ms = timer_remaining_ms;
+        session
+    }
+
     #[test]
     fn accepts_matching_client_hello() {
         let outcome = classify_hello_gate(
@@ -6192,5 +6386,63 @@ mod handshake_tests {
             Some((DraftStatus::Drafting, 2, 13)),
             Some((DraftStatus::Deckbuilding, 2, 13)),
         ));
+    }
+
+    #[test]
+    fn draft_pick_timer_uses_lobby_timer_or_default() {
+        use draft_core::types::{DraftStatus, PodPolicy};
+
+        let mut session =
+            draft_timer_session(PodPolicy::Competitive, DraftStatus::Lobby, Some(45), None);
+        assert_eq!(draft_pick_timer_seconds(&session), 45);
+
+        session.lobby_meta.as_mut().unwrap().timer_seconds = Some(0);
+        assert_eq!(
+            draft_pick_timer_seconds(&session),
+            DEFAULT_DRAFT_PICK_TIMER_SECONDS
+        );
+
+        session.lobby_meta = None;
+        assert_eq!(
+            draft_pick_timer_seconds(&session),
+            DEFAULT_DRAFT_PICK_TIMER_SECONDS
+        );
+    }
+
+    #[test]
+    fn restored_pick_timer_rearms_only_competitive_drafting_pods() {
+        use draft_core::types::{DraftStatus, PodPolicy};
+
+        let session = draft_timer_session(
+            PodPolicy::Competitive,
+            DraftStatus::Drafting,
+            Some(45),
+            Some(1_100),
+        );
+        assert_eq!(restored_pick_timer_seconds(&session), Some(2));
+
+        let session = draft_timer_session(
+            PodPolicy::Competitive,
+            DraftStatus::Drafting,
+            Some(45),
+            None,
+        );
+        assert_eq!(restored_pick_timer_seconds(&session), Some(45));
+
+        let session = draft_timer_session(
+            PodPolicy::Casual,
+            DraftStatus::Drafting,
+            Some(45),
+            Some(1_100),
+        );
+        assert_eq!(restored_pick_timer_seconds(&session), None);
+
+        let session = draft_timer_session(
+            PodPolicy::Competitive,
+            DraftStatus::Lobby,
+            Some(45),
+            Some(1_100),
+        );
+        assert_eq!(restored_pick_timer_seconds(&session), None);
     }
 }

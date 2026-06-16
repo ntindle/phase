@@ -13,7 +13,17 @@
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "tauri:android:init": "tauri android init --ci",
+    "tauri:android:dev": "tauri android dev",
+    "tauri:android:open": "tauri android dev --open",
+    "tauri:android:run": "tauri android run",
+    "tauri:android:build": "tauri android build --apk --aab --ci",
+    "tauri:ios:init": "tauri ios init --ci",
+    "tauri:ios:dev": "tauri ios dev",
+    "tauri:ios:open": "tauri ios dev --open",
+    "tauri:ios:run": "tauri ios run",
+    "tauri:ios:build": "tauri ios build --ci"
   },
   "dependencies": {
     "@fontsource-variable/jetbrains-mono": "^5.2.8",

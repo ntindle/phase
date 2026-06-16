@@ -519,7 +519,9 @@ export function GameProvider({
       if (mode === "ai") {
         setupRandomAvatars(playerCount ?? 2, gameId);
       } else if (mode === "draft-match") {
-        setupDraftMatchAvatars(gameId);
+        if (source !== "server-draft") {
+          setupDraftMatchAvatars(gameId);
+        }
       } else {
         useMultiplayerStore.setState({ playerNames: new Map(), playerAvatars: new Map() });
       }

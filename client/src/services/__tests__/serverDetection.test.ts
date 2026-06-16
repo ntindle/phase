@@ -1,6 +1,13 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { formatJoinShare, mixedContentBlockReason, parseJoinCode } from "../serverDetection";
+import {
+  DEFAULT_SERVER,
+  detectServerUrl,
+  formatJoinShare,
+  mixedContentBlockReason,
+  parseJoinCode,
+} from "../serverDetection";
+import { useMultiplayerStore } from "../../stores/multiplayerStore";
 
 describe("parseJoinCode", () => {
   it("returns just the code when no server address is present", () => {
@@ -96,6 +103,68 @@ describe("formatJoinShare", () => {
       code: "K42QQS",
       serverAddress: "ws://192.168.1.5:9374/ws",
     });
+  });
+});
+
+describe("detectServerUrl", () => {
+  const originalUserAgent = window.navigator.userAgent;
+  const originalMaxTouchPoints = window.navigator.maxTouchPoints;
+  const originalTauriDescriptor = Object.getOwnPropertyDescriptor(
+    window,
+    "__TAURI_INTERNALS__",
+  );
+
+  function setTauriRuntime() {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      value: {},
+      configurable: true,
+    });
+  }
+
+  function setUserAgent(userAgent: string, maxTouchPoints = 0) {
+    Object.defineProperty(window.navigator, "userAgent", {
+      value: userAgent,
+      configurable: true,
+    });
+    Object.defineProperty(window.navigator, "maxTouchPoints", {
+      value: maxTouchPoints,
+      configurable: true,
+    });
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    useMultiplayerStore.setState({ serverAddress: DEFAULT_SERVER });
+
+    if (originalTauriDescriptor) {
+      Object.defineProperty(
+        window,
+        "__TAURI_INTERNALS__",
+        originalTauriDescriptor,
+      );
+    } else {
+      delete (window as Window & { __TAURI_INTERNALS__?: unknown })
+        .__TAURI_INTERNALS__;
+    }
+    Object.defineProperty(window.navigator, "userAgent", {
+      value: originalUserAgent,
+      configurable: true,
+    });
+    Object.defineProperty(window.navigator, "maxTouchPoints", {
+      value: originalMaxTouchPoints,
+      configurable: true,
+    });
+  });
+
+  it("does not probe the desktop localhost sidecar from a mobile Tauri shell", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal("fetch", fetchMock);
+    setTauriRuntime();
+    setUserAgent("Mozilla/5.0 (Linux; Android 15) AppleWebKit/605.1.15");
+    useMultiplayerStore.setState({ serverAddress: "not a websocket url" });
+
+    await expect(detectServerUrl()).resolves.toBe(DEFAULT_SERVER);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 

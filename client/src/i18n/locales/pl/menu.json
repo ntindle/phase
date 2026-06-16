@@ -74,6 +74,8 @@
       "continue": "Wróć tam, gdzie skończyłeś",
       "resumeDraft": "Wznów draft",
       "draftPod": "Pod draftowy",
+      "serverDraft": "Draft serwerowy",
+      "draftCode": "Kod {{code}}",
       "activeDeck": "Aktywna talia",
       "noActiveDeck": "Wybierz talię, aby zacząć",
       "fromFeeds": "Z Twoich kanałów",

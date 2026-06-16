@@ -176,4 +176,50 @@ describe("withReconnect", () => {
       vi.useRealTimers();
     }
   });
+
+  it("uses the post-open attempt budget after a live socket drops", async () => {
+    vi.useFakeTimers();
+    try {
+      const sockets: MockWebSocket[] = [];
+      const factory = vi.fn(async () => {
+        if (factory.mock.calls.length === 1) {
+          const ws = new MockWebSocket("ws://test");
+          sockets.push(ws);
+          return {
+            ws: ws as unknown as WebSocket,
+            serverInfo: {
+              version: "",
+              buildCommit: "",
+              protocolVersion: 1,
+              mode: "Full" as const,
+            },
+            close: () => ws.close(),
+          };
+        }
+        throw new HandshakeError("ws_error", "simulated");
+      });
+
+      const states: string[] = [];
+      const handle = withReconnect(factory, {
+        attempts: 1,
+        postOpenAttempts: 3,
+        backoffMs: () => 10,
+        onStateChange: (s) => states.push(s),
+      });
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(states).toContain("open");
+
+      sockets[0].close();
+      for (let i = 0; i < 6; i++) {
+        await vi.advanceTimersByTimeAsync(20);
+      }
+
+      expect(factory).toHaveBeenCalledTimes(4);
+      expect(states).toContain("offline");
+      handle.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

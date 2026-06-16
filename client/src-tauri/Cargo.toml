@@ -7,6 +7,9 @@ license = "MIT OR Apache-2.0"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
 [dependencies]
 engine = { path = "../../crates/engine" }
 phase-ai = { path = "../../crates/phase-ai" }

@@ -1,4 +1,4 @@
-import { isTauri } from "./sidecar";
+import { canUseSidecar } from "./sidecar";
 import { useMultiplayerStore } from "../stores/multiplayerStore";
 
 const DEFAULT_PORT = 9374;
@@ -50,13 +50,13 @@ export function isValidWebSocketUrl(value: string): boolean {
 
 /**
  * Detect the best WebSocket server URL by trying in order:
- * 1. Tauri sidecar on localhost
+ * 1. Desktop Tauri sidecar on localhost
  * 2. Last-used server address from store
  * 3. Default production server
  */
 export async function detectServerUrl(): Promise<string> {
-  // Step 1: If running in Tauri, check localhost sidecar
-  if (isTauri()) {
+  // Step 1: If running in a desktop Tauri shell, check the bundled sidecar.
+  if (canUseSidecar()) {
     const sidecarUrl = await tryHealthCheck(`http://localhost:${DEFAULT_PORT}/health`);
     if (sidecarUrl) {
       return `ws://localhost:${DEFAULT_PORT}/ws`;

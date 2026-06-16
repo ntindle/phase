@@ -48,6 +48,9 @@ client/public/decks.json
 client/public/decks-skipped.json
 client/public/draft-pools.json
 client/public/parser-warning-patterns.json
+# Same generated assets copied into the Android Tauri bundle
+client/src-tauri/gen/android/app/src/main/assets/data/card-data.json
+client/src-tauri/gen/android/app/src/main/assets/data/draft-pools.json
 # Atomic-write staging files from gen-card-data.sh (cleaned on normal exit,
 # but may linger after SIGKILL / power loss).
 client/public/*.tmp

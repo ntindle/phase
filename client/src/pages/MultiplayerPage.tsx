@@ -3,8 +3,15 @@ import { useTranslation } from "react-i18next";
 import { useLocation, useNavigate } from "react-router";
 
 import type { GameFormat } from "../adapter/types";
+import type { DraftPlayerView } from "../adapter/draft-adapter";
+import type { DraftPhase, ServerDraftAdapter } from "../adapter/server-draft-adapter";
 import { useAudioContext } from "../audio/useAudioContext";
+import { CardPreview, type CardHoverInfo } from "../components/card/CardPreview";
 import { DiscordBadge } from "../components/chrome/DiscordBadge";
+import { DraftProgress } from "../components/draft/DraftProgress";
+import { LimitedDeckBuilder } from "../components/draft/LimitedDeckBuilder";
+import { PackDisplay } from "../components/draft/PackDisplay";
+import { PoolPanel } from "../components/draft/PoolPanel";
 import { ScreenChrome } from "../components/chrome/ScreenChrome";
 import { useInShell } from "../components/chrome/ShellContext";
 import { BrokerOfflinePrompt } from "../components/lobby/BrokerOfflinePrompt";
@@ -38,7 +45,14 @@ import type { HostSettings } from "../components/lobby/HostSetup";
 type ConnectionMode = "server" | "p2p";
 
 function parseViewParam(value: string | null): MultiplayerView {
-  if (value === "host-setup" || value === "deck-select" || value === "draft-lobby") return value;
+  if (
+    value === "host-setup" ||
+    value === "deck-select" ||
+    value === "draft-lobby" ||
+    value === "server-draft"
+  ) {
+    return value;
+  }
   return "lobby";
 }
 
@@ -78,6 +92,14 @@ export function MultiplayerPage() {
   const startHosting = useMultiplayerStore((s) => s.startHosting);
   const startP2PHostingSession = useMultiplayerStore((s) => s.startP2PHostingSession);
   const showToast = useMultiplayerStore((s) => s.showToast);
+  const joinServerDraft = useMultiplayerStore((s) => s.joinServerDraft);
+  const resumeServerDraft = useMultiplayerStore((s) => s.resumeServerDraft);
+  const submitServerDraftPick = useMultiplayerStore((s) => s.submitServerDraftPick);
+  const submitServerDraftDeck = useMultiplayerStore((s) => s.submitServerDraftDeck);
+  const leaveServerDraft = useMultiplayerStore((s) => s.leaveServerDraft);
+  const serverDraftAdapter = useMultiplayerStore((s) => s.draftAdapter);
+  const serverDraftView = useMultiplayerStore((s) => s.draftView);
+  const serverDraftPhase = useMultiplayerStore((s) => s.draftPhase);
 
   const draftPhase = useMultiplayerDraftStore((s) => s.phase);
   const draftRoomCode = useMultiplayerDraftStore((s) => s.roomCode);
@@ -173,6 +195,30 @@ export function MultiplayerPage() {
       setConnectionMode("server");
     }
   }, [serverAddress]);
+
+  useEffect(() => {
+    if (view !== "server-draft") return;
+    if (serverDraftAdapter || serverDraftView || serverDraftPhase) return;
+
+    let cancelled = false;
+    void resumeServerDraft().then((ok) => {
+      if (cancelled || ok) return;
+      showToast(t("serverDraftPanel.resumeFailed"));
+      setView("lobby");
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    view,
+    serverDraftAdapter,
+    serverDraftView,
+    serverDraftPhase,
+    resumeServerDraft,
+    showToast,
+    t,
+  ]);
 
   // Live legality check: whenever the user is on host-setup with an active
   // deck and a chosen format, re-run the engine's compatibility check after
@@ -520,19 +566,24 @@ export function MultiplayerPage() {
     navigate("/draft?mode=multiplayer");
   }, [navigate]);
 
-  // Join a draft pod from the lobby. Draft entries carry `draft_metadata`
-  // and are always P2P — the guest joins via PeerJS room code.
+  // Join a draft pod from the lobby. P2P draft rows use the PeerJS pod store;
+  // server-run draft rows stay on the backend WebSocket draft adapter.
   const handleJoinDraftFromLobby = useCallback(
-    async (code: string, _context?: LobbyGame) => {
+    async (code: string, password?: string, context?: LobbyGame) => {
       const playerName = useMultiplayerStore.getState().displayName ?? "Player";
       try {
-        await joinDraft({ roomCode: code, displayName: playerName });
-        setView("draft-lobby");
+        if (context?.is_p2p === true || !serverAddress) {
+          await joinDraft({ roomCode: code, displayName: playerName });
+          setView("draft-lobby");
+        } else {
+          await joinServerDraft(serverAddress, code, playerName, password);
+          setView("server-draft");
+        }
       } catch {
         showToast(t("page.failedToJoinDraft"));
       }
     },
-    [joinDraft, showToast, t],
+    [joinDraft, joinServerDraft, serverAddress, showToast, t],
   );
 
   const handleSpectate = useCallback(
@@ -573,7 +624,7 @@ export function MultiplayerPage() {
       // Draft entries bypass the normal join-with-deck flow entirely — draft
       // pods handle their own deck building after the draft completes.
       if (context?.draft_metadata) {
-        void handleJoinDraftFromLobby(code, context);
+        void handleJoinDraftFromLobby(code, password, context);
         return;
       }
 
@@ -671,6 +722,10 @@ export function MultiplayerPage() {
       setView("lobby");
       return;
     }
+    if (view === "server-draft") {
+      setView("lobby");
+      return;
+    }
     navigate("/");
   };
 
@@ -694,7 +749,9 @@ export function MultiplayerPage() {
         ? t("page.titleHostSetup")
         : view === "draft-lobby"
           ? t("page.titleDraftLobby")
-          : t("page.titleDeckSelect");
+          : view === "server-draft"
+            ? t("page.titleServerDraft")
+            : t("page.titleDeckSelect");
 
   const description =
     view === "lobby"
@@ -703,9 +760,11 @@ export function MultiplayerPage() {
         ? t("page.descriptionHostSetup")
         : view === "draft-lobby"
           ? t("page.descriptionDraftLobby")
-          : selectedFormat
-            ? t("page.descriptionDeckSelectFormat", { format: selectedFormat })
-            : t("page.descriptionDeckSelect");
+          : view === "server-draft"
+            ? t("page.descriptionServerDraft")
+            : selectedFormat
+              ? t("page.descriptionDeckSelectFormat", { format: selectedFormat })
+              : t("page.descriptionDeckSelect");
 
   return (
     <div className="menu-scene relative flex min-h-screen flex-col overflow-hidden">
@@ -732,7 +791,13 @@ export function MultiplayerPage() {
         title={title}
         description={description}
         layout="stacked"
-        contentWidthClass={view === "host-setup" ? "max-w-4xl" : "max-w-3xl"}
+        contentWidthClass={
+          view === "server-draft"
+            ? "max-w-6xl"
+            : view === "host-setup"
+              ? "max-w-4xl"
+              : "max-w-3xl"
+        }
       >
         <div className="flex w-full flex-col items-start">
         {/* Player identity — always available on lobby/host-setup so users
@@ -846,6 +911,27 @@ export function MultiplayerPage() {
           />
         )}
 
+        {view === "server-draft" && (
+          <ServerDraftPanel
+            adapter={serverDraftAdapter}
+            phase={serverDraftPhase}
+            view={serverDraftView}
+            onPick={submitServerDraftPick}
+            onSubmitDeck={submitServerDraftDeck}
+            onReconnect={async () => {
+              const ok = await resumeServerDraft();
+              if (!ok) {
+                showToast(t("serverDraftPanel.resumeFailed"));
+                setView("lobby");
+              }
+            }}
+            onLeave={() => {
+              leaveServerDraft();
+              setView("lobby");
+            }}
+          />
+        )}
+
         {view === "deck-select" && (
           <>
             {pendingAction?.type === "join" && pendingAction.context && (
@@ -936,6 +1022,318 @@ export function MultiplayerPage() {
         />
       )}
     </div>
+  );
+}
+
+// ── Server Draft Panel ────────────────────────────────────────────────
+//
+// Backend-hosted drafts use ServerDraftAdapter, not the P2P draft pod store.
+// This panel intentionally reads only adapter/store state so it can be opened
+// from a persisted mobile resume token without routing through /draft.
+
+function serverDraftPhaseKey(phase: DraftPhase): string {
+  switch (phase) {
+    case "lobby":
+      return "serverDraftPanel.phase.lobby";
+    case "drafting":
+      return "serverDraftPanel.phase.drafting";
+    case "deckbuilding":
+      return "serverDraftPanel.phase.deckbuilding";
+    case "match":
+      return "serverDraftPanel.phase.match";
+    case "between_rounds":
+      return "serverDraftPanel.phase.betweenRounds";
+    case "complete":
+      return "serverDraftPanel.phase.complete";
+  }
+}
+
+function serverDraftStatusKey(status: DraftPlayerView["status"]): string {
+  switch (status) {
+    case "Lobby":
+      return "serverDraftPanel.status.lobby";
+    case "Drafting":
+      return "serverDraftPanel.status.drafting";
+    case "Paused":
+      return "serverDraftPanel.status.paused";
+    case "Deckbuilding":
+      return "serverDraftPanel.status.deckbuilding";
+    case "Pairing":
+      return "serverDraftPanel.status.pairing";
+    case "MatchInProgress":
+      return "serverDraftPanel.status.matchInProgress";
+    case "RoundComplete":
+      return "serverDraftPanel.status.roundComplete";
+    case "Complete":
+      return "serverDraftPanel.status.complete";
+    case "Abandoned":
+      return "serverDraftPanel.status.abandoned";
+  }
+}
+
+function formatDraftTimer(ms: number | null): string | null {
+  if (ms == null) return null;
+  const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+function expandLimitedDeck(
+  mainDeck: string[],
+  landCounts: Record<string, number>,
+): string[] {
+  const lands = Object.entries(landCounts).flatMap(([name, count]) =>
+    Array<string>(Math.max(0, count)).fill(name)
+  );
+  return [...mainDeck, ...lands];
+}
+
+function ServerDraftPanel({
+  adapter,
+  phase,
+  view,
+  onPick,
+  onSubmitDeck,
+  onReconnect,
+  onLeave,
+}: {
+  adapter: ServerDraftAdapter | null;
+  phase: DraftPhase | null;
+  view: DraftPlayerView | null;
+  onPick: (cardInstanceId: string) => Promise<void>;
+  onSubmitDeck: (mainDeck: string[]) => Promise<void>;
+  onReconnect: () => Promise<void>;
+  onLeave: () => void;
+}) {
+  const { t } = useTranslation("multiplayer");
+  const [hoveredCard, setHoveredCard] = useState<CardHoverInfo | null>(null);
+  const [selectedCard, setSelectedCard] = useState<string | null>(null);
+  const [mainDeck, setMainDeck] = useState<string[]>([]);
+  const [landCounts, setLandCounts] = useState<Record<string, number>>({});
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const draftCode = adapter?.currentDraftCode;
+  const seatIndex = adapter?.currentSeatIndex;
+  const gameCode = adapter?.gameCode;
+  const timerLabel = formatDraftTimer(view?.timer_remaining_ms ?? null);
+  const occupiedSeats = view?.seats.filter((seat) => seat.display_name).length ?? 0;
+  const totalSeats = view?.seats.length ?? 0;
+  const interactiveDraft = view?.status === "Drafting" || view?.status === "Deckbuilding";
+
+  useEffect(() => {
+    setSelectedCard(null);
+  }, [view?.current_pack_number, view?.pick_number]);
+
+  useEffect(() => {
+    if (view?.status !== "Deckbuilding") return;
+    setError(null);
+  }, [view?.status]);
+
+  const handleConfirmPick = async () => {
+    if (!selectedCard || submitting) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      await onPick(selectedCard);
+      setSelectedCard(null);
+    } catch {
+      setError(t("serverDraftPanel.pickFailed"));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleSubmitDeck = async () => {
+    if (submitting) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      await onSubmitDeck(expandLimitedDeck(mainDeck, landCounts));
+    } catch {
+      setError(t("serverDraftPanel.deckSubmitFailed"));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <MenuPanel
+      className={`relative z-10 flex w-full flex-col gap-5 px-5 py-6 ${
+        interactiveDraft ? "max-w-6xl" : "max-w-3xl"
+      }`}
+    >
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <div className="text-[0.68rem] uppercase tracking-[0.22em] text-slate-500">
+            {t("serverDraftPanel.serverDraft")}
+          </div>
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-slate-300">
+            {phase ? (
+              <span className="rounded-full border border-emerald-400/20 bg-emerald-500/[0.07] px-2.5 py-0.5 text-emerald-200">
+                {t(serverDraftPhaseKey(phase))}
+              </span>
+            ) : (
+              <span className="rounded-full border border-cyan-400/20 bg-cyan-500/[0.07] px-2.5 py-0.5 text-cyan-200">
+                {t("serverDraftPanel.reconnecting")}
+              </span>
+            )}
+            {view && <span>{t(serverDraftStatusKey(view.status))}</span>}
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2 sm:justify-end">
+          {draftCode && (
+            <span className="rounded-full border border-white/10 bg-black/18 px-2.5 py-0.5 font-mono text-xs tracking-wider text-purple-300">
+              {draftCode}
+            </span>
+          )}
+          {seatIndex != null && (
+            <span className="rounded-full border border-white/10 bg-black/18 px-2.5 py-0.5 text-xs text-slate-300">
+              {t("serverDraftPanel.seat", { number: seatIndex + 1 })}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {!view && (
+        <div className="rounded-[16px] border border-cyan-400/20 bg-cyan-500/[0.07] px-4 py-3 text-sm text-cyan-100">
+          {t("serverDraftPanel.reconnectingDetail")}
+        </div>
+      )}
+
+      {error && (
+        <div className="rounded-[16px] border border-rose-400/20 bg-rose-500/[0.07] px-4 py-3 text-sm text-rose-200">
+          {error}
+        </div>
+      )}
+
+      {view?.status === "Lobby" && totalSeats > 0 && (
+        <div className="flex flex-col gap-3">
+          <div className="text-sm text-slate-300">
+            {t("serverDraftPanel.playersJoined", { joined: occupiedSeats, total: totalSeats })}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {view.seats.map((seat) => (
+              <div
+                key={seat.seat_index}
+                className={`rounded-lg border px-3 py-1.5 text-xs ${
+                  seat.display_name
+                    ? "border-emerald-400/20 bg-emerald-500/[0.07] text-emerald-200"
+                    : "border-white/8 bg-black/16 text-slate-500"
+                }`}
+              >
+                {seat.display_name || t("serverDraftPanel.seat", { number: seat.seat_index + 1 })}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {view?.status === "Drafting" && (
+        <>
+          <CardPreview
+            cardName={hoveredCard?.name ?? null}
+            sourcePrinting={hoveredCard?.sourcePrinting}
+            mobileLayout="compact"
+            onDismiss={() => setHoveredCard(null)}
+          />
+          <div className="flex flex-col gap-4 xl:flex-row">
+            <div className="min-w-0 flex-1">
+              <div className="mb-4">
+                <DraftProgress view={view} />
+              </div>
+              {timerLabel && (
+                <div className="mb-4 rounded-[16px] border border-amber-400/20 bg-amber-500/[0.07] px-4 py-3 text-sm text-amber-100">
+                  {t("serverDraftPanel.timer", { time: timerLabel })}
+                </div>
+              )}
+              <PackDisplay
+                view={view}
+                selectedCard={selectedCard}
+                onSelectCard={setSelectedCard}
+                onConfirmPick={handleConfirmPick}
+                onCardHover={setHoveredCard}
+              />
+            </div>
+            <div className="w-full shrink-0 rounded-[16px] border border-white/8 bg-black/16 xl:w-80">
+              <PoolPanel view={view} onCardHover={setHoveredCard} />
+            </div>
+          </div>
+        </>
+      )}
+
+      {view?.status === "Deckbuilding" && (
+        <LimitedDeckBuilder
+          view={view}
+          mainDeck={mainDeck}
+          landCounts={landCounts}
+          onAddToDeck={(cardName) => setMainDeck((current) => [...current, cardName])}
+          onRemoveFromDeck={(cardName) =>
+            setMainDeck((current) => {
+              const index = current.indexOf(cardName);
+              if (index < 0) return current;
+              const next = [...current];
+              next.splice(index, 1);
+              return next;
+            })
+          }
+          onSetLandCount={(landName, count) =>
+            setLandCounts((current) => ({
+              ...current,
+              [landName]: Math.max(0, count),
+            }))
+          }
+          onSubmitDeck={handleSubmitDeck}
+          showSuggestions={false}
+        />
+      )}
+
+      {phase === "match" && (
+        <div className="rounded-[16px] border border-emerald-400/20 bg-emerald-500/[0.07] px-4 py-3 text-sm text-emerald-100">
+          {t("serverDraftPanel.matchReady", { round: view?.current_round ?? 1 })}
+          {gameCode && (
+            <span className="ml-2 font-mono text-xs tracking-wider text-emerald-200">
+              {gameCode}
+            </span>
+          )}
+        </div>
+      )}
+
+      {view?.status === "Complete" && view.standings.length > 0 && (
+        <div className="flex flex-col gap-2">
+          {view.standings.slice(0, 3).map((standing, index) => (
+            <div
+              key={standing.seat_index}
+              className="flex items-center justify-between rounded-lg border border-white/8 bg-black/16 px-3 py-2 text-sm"
+            >
+              <span className="text-slate-300">
+                {t("serverDraftPanel.placement", { place: index + 1, name: standing.display_name })}
+              </span>
+              <span className="font-mono text-xs text-slate-400">
+                {standing.match_wins}-{standing.match_losses}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="flex flex-col gap-2 border-t border-white/8 pt-4 sm:flex-row sm:justify-end">
+        <button
+          type="button"
+          onClick={() => void onReconnect()}
+          className={menuButtonClass({ tone: "cyan", size: "sm" })}
+        >
+          {t("serverDraftPanel.reconnect")}
+        </button>
+        <button
+          type="button"
+          onClick={onLeave}
+          className={menuButtonClass({ tone: "neutral", size: "sm" })}
+        >
+          {t("serverDraftPanel.leaveDraft")}
+        </button>
+      </div>
+    </MenuPanel>
   );
 }
 

@@ -12,6 +12,24 @@ export function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
+/** Check whether this Tauri webview is likely running on an iOS/Android shell. */
+export function isLikelyMobileRuntime(): boolean {
+  if (typeof navigator === "undefined") {
+    return false;
+  }
+
+  const userAgent = navigator.userAgent.toLowerCase();
+  return (
+    /android|iphone|ipad|ipod/.test(userAgent) ||
+    (userAgent.includes("macintosh") && navigator.maxTouchPoints > 1)
+  );
+}
+
+/** Sidecars are bundled only in desktop Tauri builds. */
+export function canUseSidecar(): boolean {
+  return isTauri() && !isLikelyMobileRuntime();
+}
+
 export interface SidecarHandle {
   port: number;
   kill: () => Promise<void>;
@@ -25,7 +43,7 @@ let activeSidecar: SidecarHandle | null = null;
  * Scans ports 9374-9383 and performs a health check before returning.
  */
 export async function spawnSidecar(port = 9374): Promise<SidecarHandle> {
-  if (!isTauri()) {
+  if (!canUseSidecar()) {
     throw new Error("Sidecar is only available in Tauri desktop builds");
   }
 

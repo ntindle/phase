@@ -423,7 +423,7 @@ select.select-dark option {
 
 /* Deck builder fills the shell content column without forcing a page scrollbar.
    Subtracts the sticky social header and (on narrow viewports) the bottom tab
-   bar reserve that shell-content already applies via pb-[76px]. */
+   bar reserve that shell-content also applies, including mobile safe-area. */
 .deck-builder-shell {
   height: calc(100dvh - env(safe-area-inset-top) - 44px - 76px - env(safe-area-inset-bottom));
 }

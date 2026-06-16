@@ -74,6 +74,8 @@
       "continue": "Riprendi da dove avevi lasciato",
       "resumeDraft": "Riprendi draft",
       "draftPod": "Pod di draft",
+      "serverDraft": "Draft server",
+      "draftCode": "Codice {{code}}",
       "activeDeck": "Mazzo attivo",
       "noActiveDeck": "Scegli un mazzo per iniziare",
       "fromFeeds": "Dai tuoi feed",
