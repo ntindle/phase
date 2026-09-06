@@ -74,7 +74,7 @@ START=$SECONDS
 CFG="$HOME/.cargo/config.toml"
 if ! grep -qF "$MARKER" "$CFG" 2>/dev/null; then
   {
-    echo ""
+    [ -s "$CFG" ] && echo ""
     echo "$MARKER"
     echo "[build]"
     echo "target-dir = \"$TARGET\""
@@ -104,9 +104,14 @@ echo "checkout: $(git rev-parse --short HEAD) $(git log -1 --format=%s)"
 # 3. The pinned nightly from rust-toolchain.toml (rustup auto-installs it).
 rustup show active-toolchain || rustup toolchain install || true
 
-# 4. Network-bound side tasks overlap with the compile.
+# 4. Network-bound side tasks overlap with the compile. Their PIDs are kept
+#    because a bare `wait` in bash 5.2 also waits on the `tee` process
+#    substitution above, which cannot exit while this script's stdout is open,
+#    so `wait` with no arguments deadlocks after the real jobs finish.
 ( ./scripts/fetch-comp-rules.sh && cp docs/MagicCompRules.txt "$CACHE/MagicCompRules.txt" ) &
+CR_PID=$!
 ( cd client && pnpm install --frozen-lockfile >/dev/null ) &
+PNPM_PID=$!
 
 # 5. The build that every engine task needs. `cargo test --no-run` compiles the
 #    dependency graph, the engine, and its unit + integration test binaries.
@@ -117,7 +122,7 @@ if cargo test -p phase-engine --no-run "$@"; then
 else
   echo "engine test build FAILED after $((SECONDS - t))s (partial artifacts kept)"
 fi
-wait
+wait "$CR_PID" "$PNPM_PID"
 
 # 6. Leave the path free for the session's own clone.
 if [ "$CLONED_HERE" = 1 ]; then
